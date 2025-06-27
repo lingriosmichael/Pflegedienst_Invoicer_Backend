@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>Rechnung</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      font-size: 12px;
+      color: #000;
+      margin: 20px;
+    }
+    .header {
+      font-size: 8px;
+      margin-bottom: 5px;
+    }
+    .header hr {
+      border: none;
+      border-top: 1px solid #000;
+      margin: 5px 0;
+    }
+    .footer { margin-top: 30px; }
+    .right { text-align: right; }
+    .right p { margin: 1px 0; }
+    .invoice-title { font-size: 26px; font-weight: bold; margin-bottom: 0; }
+    .meta-block {
+      float: right;
+      text-align: right;
+      font-size: 12px;
+    }
+    .meta-block p { margin: 1px 0; }
+    .info-block { margin-top: 15px; font-size: 14px; margin-bottom: 0; }
+    .info-block p { margin: 8px 0; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 20px;
+      border: none;
+    }
+    th, td {
+      border: none;
+      padding: 6px;
+      text-align: left;
+    }
+    .totals td {
+      border: none;
+      padding-top: 20px;
+      padding-bottom: 20px;
+    }
+    .invoice-total {
+      font-size: 14px;
+      font-weight: bold;
+      text-align: right;
+    }
+  </style>
+</head>
+<body>
+  <br><br><br>
+  <div class="header">
+    <p>Häusliche Senioren- und Krankenpflege Schwester Petra Jung Beethovenstr. 2 • 02763 Zittau</p>
+    <hr>
+  </div>
+
+  <div class="info-block">
+    <p>Herrn / Frau <br>
+    {{ patient.name }}<br>
+    {% set address_line1, address_line2 = patient.address | split_address %}
+    {{ address_line1 }}<br>
+    {{ address_line2 }}</p>
+  </div>
+
+  <div class="meta-block">
+    <p>Datum: <strong>{{ today }}</strong></p>
+    <p>Rechnung-Nr.: <strong>{{ invoice.invoice_number }}</strong></p>
+    <p>Debitoren-Nr.: <strong>{{ patient.debtor_number or "-" }}</strong></p>
+    <p style="font-size: 9px;">Bei Zahlungen bitte immer Rechnung-Nr angeben!</p>
+  </div>
+
+  <br><br><br><br><br><br>
+
+  <div class="invoice-title">Abrechnung</div>
+  <div class="info-block">
+    <p>für den Zeitraum vom <strong>{{ invoice.pflegezeitraum_beginn }}</strong> bis <strong>{{ invoice.pflegezeitraum_ende }}</strong></p>
+    <p><strong>{{ patient.name }}, geb. am {{ patient.birthdate }}</strong></p>
+    <p>{{ address_line1 }}, {{ address_line2 }}</p>
+  </div>
+
+  <div class="right">
+    <p>Versich.-Nr.: <strong>{{ patient.insurance_number }}</strong></p>
+    <p>Pflegegrad: <strong>{{ patient.care_level }}</strong> Ambulant</p>
+  </div>
+
+  {% set pflegesumme = invoice.summe_total | float %}
+  {% set invest = pflegesumme * 0.06 %}
+  {% set covered = invoice.summe_covered | float %}
+  {% set needs_service_paket = patient.insurance_number in ["G052782637", "P815949722", "I206016241", "E813094835"] %}
+  {% set service_fee = 40.00 if needs_service_paket else 0.00 %}
+  {% set final_total = pflegesumme + invest + service_fee - covered %}
+  {% set invest_str = ("%0.2f"|format(invest)) %}
+  {% set final_total_str = ("%0.2f"|format(final_total)) %}
+
+  <br><br><br>
+  <table>
+    <thead>
+      <tr>
+        <th>Lst.-Nr.</th>
+        <th>Leistung</th>
+        <th>Anzahl</th>
+        <th>Betrag</th>
+        <th>Gesamt</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in services %}
+      <tr>
+        <td>{{ item.code }}</td>
+        <td>{{ item.description }}</td>
+        <td>{{ item.quantity }}</td>
+        <td>{{ "%.2f"|format(item.unit_price|float) }} EUR</td>
+        <td>{{ "%.2f"|format(item.total_price|float) }} EUR</td>
+      </tr>
+      {% endfor %}
+      <tr>
+        <td></td>
+        <td>Investitionskosten 6% von Pflegesumme</td>
+        <td></td>
+        <td></td>
+        <td>{{ invest_str }} EUR</td>
+      </tr>
+      <tr>
+        <td></td>
+        <td>Abzug Pflegegrad</td>
+        <td></td>
+        <td></td>
+        <td>-{{ "%.2f"|format(invoice.summe_covered|float) }} EUR</td>
+      </tr>
+      {% if needs_service_paket %}
+      <tr>
+        <td></td>
+        <td>Service Paket</td>
+        <td></td>
+        <td></td>
+        <td>{{ "%.2f"|format(service_fee) }} EUR</td>
+      </tr>
+      {% endif %}
+    </tbody>
+  </table>
+
+  <br><br>
+  <table class="totals">
+    <tr>
+      <td class="invoice-total" colspan="5">Rechnungsbetrag: {{ final_total_str }} EUR</td>
+    </tr>
+  </table>
+
+  <br><br>
+  <div class="footer">
+    <p>Bitte überweisen Sie den Betrag innerhalb von 21 Tagen auf u.g. Konto.<br><br>
+    Mit freundlichen Grüßen</p>
+  </div>
+</body>
+</html>

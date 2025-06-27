@@ -1,0 +1,9 @@
+PyMuPDF
+pdfplumber
+pytesseract
+Pillow
+WeasyPrint
+Jinja2
+requests
+PyQt5>=5.15.9
+Openai

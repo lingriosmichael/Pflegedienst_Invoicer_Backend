@@ -11,7 +11,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 env = Environment(loader=FileSystemLoader(TEMPLATE_DIR))
 
-# ✅ Register the filter BEFORE rendering
 def split_address(address):
     if not address:
         return "", ""
@@ -24,7 +23,7 @@ def split_address(address):
 env.filters['split_address'] = split_address
 
 def generate_invoice_pdf(data):    
-    care_account = data["invoice"].get("care_account")
+    care_account = data["patient"].get("pflege_konto")  # adjusted from invoice["care_account"]
     if care_account == "4064":
         template_name = "invoice_template_4064.html"
     else:
@@ -55,21 +54,19 @@ def process_generate_invoices(invoicing_month=None):
     max_invoice_number = c.fetchone()[0] or 4006907
     next_invoice_number = max_invoice_number + 1
 
-    # Fetch cases filtered by invoicing_month
-    cases = get_private_invoice_cases(invoicing_month)
+    # Fetch cases with private_rechnung = true
+    cases = get_private_invoice_cases(invoicing_month=invoicing_month)
 
     for case in cases:
         try:
             current_number = case["invoice"].get("invoice_number")
-            invoice_id = case["invoice"].get("invoice_id")  # ensure this exists in your grouped result
+            invoice_id = case["invoice"].get("invoice_id")
 
-            # Assign invoice number if missing
             if not current_number:
                 assigned_number = next_invoice_number
                 next_invoice_number += 1
                 case["invoice"]["invoice_number"] = assigned_number
 
-                # Update in DB
                 c.execute("UPDATE invoices SET invoice_number = ? WHERE id = ?", (
                     assigned_number,
                     invoice_id
@@ -89,7 +86,6 @@ def regenerate_invoice(invoice_number):
     conn = sqlite3.connect("data/invoices.db")
     c = conn.cursor()
 
-    # Fetch invoice_id for the given invoice_number
     c.execute("SELECT id FROM invoices WHERE invoice_number = ?", (invoice_number,))
     result = c.fetchone()
 
@@ -106,7 +102,6 @@ def regenerate_invoice(invoice_number):
         conn.close()
         return
 
-    # There should be only one case
     case = cases[0]
 
     try:

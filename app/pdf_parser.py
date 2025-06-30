@@ -2,7 +2,7 @@ import fitz
 import re
 import time
 import os
-from app.openai_client import extract_structured_data_with_openai
+from app.openai import extract_structured_data_batch 
 from app.database import insert_structured_data
 
 
@@ -82,96 +82,52 @@ def clean_4064(structured):
     if structured["patient"].get("pflege_konto") == "4064":
         structured["invoice"]["summe_covered"] = "127,35"
 
-def filter_chunks_by_mode(chunks, mode):
-    filtered = []
-
-    for i, chunk in enumerate(chunks):
-        chunk_lower = chunk.lower()
-
-        if mode == "sgbxi":
-            if any(code in chunk_lower for code in ("pflegekonto: 4092", "pflegekonto: 4062", "pflegekonto: 4064")):
-                print(f"⛔️ Skipping chunk {i+1} — excluded pflegekonto (4092, 4062, 4064).")
-                continue
-
-        elif mode == "entleistung":
-            if "pflegekonto: 4064" not in chunk_lower:
-                print(f"⛔️ Skipping chunk {i+1} — not pflegekonto 4064.")
-                continue
-
-            match = re.findall(r"Summe €\n([\d.,]+)\n([\d.,]+)", chunk, flags=re.IGNORECASE)
-            if match:
-                totals = list(map(lambda s: float(s.replace(".", "").replace(",", ".")), match[0]))
-                if max(totals) <= 128:
-                    print(f"⛔️ Skipping chunk {i+1} — sum_total ≤ 128 EUR.")
-                    continue
-
-        else:
-            print(f"❌ Invalid mode: {mode}")
-            break
-
-        filtered.append(chunk)
-
-    return filtered
-
-def process_import_sgbxi(text_chunks, abrechnungsmonat):
+def process_import(text_chunks, abrechnungsmonat):
     inserted = 0
 
-    for i, chunk in enumerate(text_chunks):
-        print("Chunk:")
-        print(chunk)
-        print(f"\n🧩 Processing chunk {i+1}")
-        structured = extract_structured_data_with_openai(chunk, retries=1)
-        print("\nStructured output:")
-        print(structured)
+    print(f"📦 Processing {len(text_chunks)} chunks...")
+    structured_list = extract_structured_data_batch(text_chunks)
+    if not structured_list:
+        print("❌ GPT extraction failed.")
+        return
 
-        if structured:
-            try:
-                patient = structured.get("patient", {})
-                invoice = structured.get("invoice", {})
-                name = patient.get("name", "[unknown]")
+    for structured in structured_list:
+        try:
+            patient = structured.get("patient", {})
+            invoice = structured.get("invoice", {})
+            name = patient.get("name", "[unknown]")
 
-                if not invoice or "summe_covered" not in invoice or "summe_total" not in invoice:
-                    print(f"⚠️ Missing invoice totals for {name}. Retrying...")
-                    structured_retry = extract_structured_data_with_openai(chunk, retries=2)
-                    invoice_retry = structured_retry.get("invoice", {}) if structured_retry else {}
+            if not invoice or "summe_covered" not in invoice or "summe_total" not in invoice:
+                print(f"⚠️ Missing invoice totals for {name}. Skipping...")
+                continue
 
-                    if "summe_covered" in invoice_retry and "summe_total" in invoice_retry:
-                        structured = structured_retry
-                        invoice = invoice_retry
+            if not patient.get("birthdate"):
+                print(f"⚠️ Patient {name} is missing birthdate.")
+                print("⛔️ Skipping due to missing birthdate.")
+                continue
+
+            structured["invoice"]["abrechnungsmonat"] = abrechnungsmonat
+            clean_4064(structured)
+
+            for attempt in range(3):
+                try:
+                    insert_structured_data(structured)
+                    print(f"✅ Inserted structured data for {patient.get('insurance_number')}")
+                    inserted += 1
+                    break
+                except Exception as e:
+                    if "database is locked" in str(e).lower():
+                        wait_time = 2 ** attempt
+                        print(f"⏳ DB locked. Retrying in {wait_time}s...")
+                        time.sleep(wait_time)
                     else:
-                        print(f"⛔️ Retry failed for {name}.")
+                        print(f"❌ Insert failed: {e}")
                         input("🔍 Press Enter to continue...")
-                        continue
-
-                if not patient.get("birthdate"):
-                    print(chunk)
-                    print(f"⚠️ Patient {name} is missing birthdate.")
-                    birthdate = input("📅 Enter birthdate: ").strip()
-                    patient["birthdate"] = birthdate
-                    continue
-
-                structured["invoice"]["abrechnungsmonat"] = abrechnungsmonat
-                clean_4064(structured)
-
-                for attempt in range(3):
-                    try:
-                        insert_structured_data(structured)
-                        print(f"✅ Inserted structured data for {patient.get('insurance_number')}")
-                        inserted += 1
                         break
-                    except Exception as e:
-                        if "database is locked" in str(e).lower():
-                            wait_time = 2 ** attempt
-                            print(f"⏳ DB locked. Retrying in {wait_time}s...")
-                            time.sleep(wait_time)
-                        else:
-                            print(f"❌ Insert failed: {e}")
-                            input("🔍 Press Enter to continue...")
-                            break
 
-            except Exception as e:
-                print(f"❌ Unexpected error for {name}: {e}")
-                input("🔍 Press Enter to continue...")
+        except Exception as e:
+            print(f"❌ Unexpected error for {name}: {e}")
+            input("🔍 Press Enter to continue...")
 
     print(f"\n✅ Inserted: {inserted}")
 
@@ -189,13 +145,13 @@ def refeed_failed_chunk_from_file():
     print("\n📦 Re-processing the following chunk:\n")
     print(chunk_text)
 
-    structured = extract_structured_data_with_openai(chunk_text, retries=2)
-    if not structured:
+    structured_list = extract_structured_data_batch([chunk_text])
+    if not structured_list:
         print("❌ Failed to extract structured data.")
         return
 
+    structured = structured_list[0]
     print("\n✅ Structured Output:")
     print(structured)
     insert_structured_data(structured)
     print("✅ Inserted successfully.")
-    

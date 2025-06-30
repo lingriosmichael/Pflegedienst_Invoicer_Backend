@@ -25,7 +25,7 @@ if __name__ == "__main__":
             print(f"\U0001F50D Found {len(chunks)} chunks in PDF.")
             sgbxi_entlastungsleistung = input("\U0001F4C9 sgbxi or entleistung: ").strip()            
             filtered_chunks = app.pdf_parser.filter_chunks_by_mode(chunks, sgbxi_entlastungsleistung)
-            app.pdf_parser.process_import_sgbxi(filtered_chunks, abrechnungsmonat)
+            app.pdf_parser.process_import(filtered_chunks, abrechnungsmonat)
 
         elif choice == "2":
             app.invoice_generator.process_generate_invoices(abrechnungsmonat)

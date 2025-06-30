@@ -1,6 +1,5 @@
 import sqlite3
 from datetime import datetime
-from collections import defaultdict
 
 DB_PATH = "data/invoices.db"
 
@@ -33,6 +32,7 @@ def init_db():
         care_account TEXT,
         invoicing_month TEXT,
         invoice_number INTEGER,
+        private_rechnung BOOLEAN DEFAULT 0,
         FOREIGN KEY(patient_id) REFERENCES patients(id)
     )
     """)
@@ -59,12 +59,9 @@ def parse_decimal(val):
     val = val.strip()
 
     if '.' in val and ',' in val:
-        # German format: "1.234,56" -> "1234.56"
         val = val.replace('.', '').replace(',', '.')
     elif ',' in val:
-        # German format without thousand separator: "9,54" -> "9.54"
         val = val.replace(',', '.')
-    # else assume it's already a valid float string: "190.8"
 
     try:
         return float(val)
@@ -121,13 +118,14 @@ def insert_structured_data(data):
     patient_id = row[0]
 
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    private_flag = int(data.get("private_rechnung", False))
 
     c.execute("""
         INSERT INTO invoices (
             patient_id, care_range_begin, care_range_end,
             sum_covered, sum_total, amount_owed, created_at,
-            care_account, invoicing_month
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            care_account, invoicing_month, private_rechnung
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         patient_id,
         invoice["pflegezeitraum_beginn"],
@@ -137,7 +135,8 @@ def insert_structured_data(data):
         invoice["amount_owed"],
         created_at,
         invoice["care_account"],
-        invoice.get("abrechnungsmonat")
+        invoice.get("abrechnungsmonat"),
+        private_flag
     ))
 
     invoice_id = c.lastrowid
@@ -171,7 +170,7 @@ def get_private_invoice_cases(invoicing_month=None, invoice_id=None):
                    patients.birthdate, patients.insurance_number, patients.care_level
             FROM invoices
             JOIN patients ON invoices.patient_id = patients.id
-            WHERE invoices.id = ?
+            WHERE invoices.id = ? AND invoices.private_rechnung = 1
         """, (invoice_id,))
     else:
         c.execute("""
@@ -182,8 +181,9 @@ def get_private_invoice_cases(invoicing_month=None, invoice_id=None):
                    patients.birthdate, patients.insurance_number, patients.care_level
             FROM invoices
             JOIN patients ON invoices.patient_id = patients.id
-            WHERE invoices.invoicing_month = ?
-        """, (invoicing_month,))
+            WHERE invoices.private_rechnung = 1
+              AND (invoices.invoicing_month = ? OR ? IS NULL)
+        """, (invoicing_month, invoicing_month))
 
     invoice_rows = c.fetchall()
 
@@ -237,7 +237,6 @@ def get_private_invoice_cases(invoicing_month=None, invoice_id=None):
 
     conn.close()
     return cases
-
 
 def check_missing_patient_fields(invoicing_month):
     conn = sqlite3.connect(DB_PATH)

@@ -224,7 +224,7 @@ class InvoiceApp(QWidget):
         text = app.pdf_parser.extract_text_from_pdf(path)
         chunks = app.pdf_parser.split_into_chunks(text)
         filtered = app.pdf_parser.filter_chunks_by_mode(chunks, mode)
-        app.pdf_parser.process_import_sgbxi(filtered, self.abrechnungsmonat)
+        app.pdf_parser.process_import(filtered, self.abrechnungsmonat)
         QMessageBox.information(self, "Erfolg", f"{len(filtered)} Abschnitte importiert.")
 
     def generate_invoices(self):

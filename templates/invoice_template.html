@@ -52,6 +52,28 @@
       font-weight: bold;
       text-align: right;
     }
+    @page {
+      size: A4;
+      margin: 2cm 2cm 3.8cm 2cm; /* reserve space at bottom */
+      @bottom-center {
+        content: element(footer);
+      }
+    }
+    #footer table {
+    width: 100%;
+    table-layout: fixed;
+    }
+    #footer td {
+      vertical-align: top;
+      width: 33%; /* force even column width */
+    }
+    #footer {
+      font-size: 10px;
+      display: block;
+      position: running(footer); /* this marks it for use in @page */
+      border-top: 1px solid black;
+      padding-top: 5px;
+    }
   </style>
 </head>
 <body>
@@ -76,7 +98,7 @@
     <p style="font-size: 9px;">Bei Zahlungen bitte immer Rechnung-Nr angeben!</p>
   </div>
 
-  <br><br><br><br><br><br>
+  <br><br><br><br><br>
 
   <div class="invoice-title">Abrechnung</div>
   <div class="info-block">
@@ -93,13 +115,14 @@
   {% set pflegesumme = invoice.summe_total | float %}
   {% set invest = pflegesumme * 0.06 %}
   {% set covered = invoice.summe_covered | float %}
-  {% set needs_service_paket = patient.insurance_number in ["G052782637", "P815949722", "I206016241", "E813094835"] %}
+  {# Use per-patient flag stored in the database to determine service packet inclusion #}
+  {% set needs_service_paket = (patient.include_service_packet | int) == 1 %}
   {% set service_fee = 40.00 if needs_service_paket else 0.00 %}
   {% set final_total = pflegesumme + invest + service_fee - covered %}
   {% set invest_str = ("%0.2f"|format(invest)) %}
   {% set final_total_str = ("%0.2f"|format(final_total)) %}
 
-  <br><br><br>
+  <br><br>
   <table>
     <thead>
       <tr>
@@ -116,8 +139,8 @@
         <td>{{ item.code }}</td>
         <td>{{ item.description }}</td>
         <td>{{ item.quantity }}</td>
-        <td>{{ "%.2f"|format(item.unit_price|float) }} EUR</td>
-        <td>{{ "%.2f"|format(item.total_price|float) }} EUR</td>
+        <td>{{ item.unit_price }} EUR</td>
+        <td>{{ item.total_price }} EUR</td>
       </tr>
       {% endfor %}
       <tr>
@@ -145,18 +168,40 @@
       {% endif %}
     </tbody>
   </table>
-
-  <br><br>
   <table class="totals">
     <tr>
       <td class="invoice-total" colspan="5">Rechnungsbetrag: {{ final_total_str }} EUR</td>
     </tr>
   </table>
 
-  <br><br>
+  <br>
   <div class="footer">
     <p>Bitte überweisen Sie den Betrag innerhalb von 21 Tagen auf u.g. Konto.<br><br>
     Mit freundlichen Grüßen</p>
   </div>
+  <div id="footer">
+  <table style="width: 100%;">
+    <tr>
+      <td>
+        Häusliche Senioren- und Krankenpflege<br>
+        Schwester Petra Jung<br>
+        Beethoven Str. 2<br>
+        02763 Zittau
+      </td>
+      <td>
+        Bank: SPK Oberlausitz-Niederschlesien<br>
+        BLZ: 85050100<br>
+        Konto: 3000201199<br>
+        IBAN: DE53 8505 0100 3000 2011 99
+      </td>
+      <td>
+        Tel: 03583/702041<br>
+        Fax: 03583/795828<br>
+        Steuernummer:<br>
+        208/236/04476
+      </td>
+    </tr>
+  </table>
+</div>
 </body>
 </html>

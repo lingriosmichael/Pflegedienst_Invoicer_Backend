@@ -52,6 +52,28 @@
       font-weight: bold;
       text-align: right;
     }
+   @page {
+    size: A4;
+    margin: 2cm 2cm 3.8cm 2cm; /* reserve space at bottom */
+    @bottom-center {
+      content: element(footer);
+    }
+  }
+  #footer table {
+  width: 100%;
+  table-layout: fixed;
+  }
+  #footer td {
+    vertical-align: top;
+    width: 33%; /* force even column width */
+  }
+  #footer {
+    font-size: 10px;
+    display: block;
+    position: running(footer); 
+    border-top: 1px solid black;
+    padding-top: 5px;
+  }
   </style>
 </head>
 <body>
@@ -119,8 +141,6 @@
       <tr>
         <td></td>
         <td>Abzug Pflegegrad</td>
-        <td></td>
-        <td></td>
         <td>-{{ "%.2f"|format(invoice.summe_covered|float) }} EUR</td>
       </tr>
     </tbody>
@@ -132,11 +152,34 @@
       <td class="invoice-total" colspan="5">Rechnungsbetrag: {{ final_total_str }} EUR</td>
     </tr>
   </table>
-
-  <br><br>
+  <br>
   <div class="footer">
     <p>Bitte überweisen Sie den Betrag innerhalb von 21 Tagen auf u.g. Konto.<br><br>
     Mit freundlichen Grüßen</p>
   </div>
+  <div id="footer">
+  <table style="width: 100%;">
+    <tr>
+      <td>
+        Häusliche Senioren- und Krankenpflege<br>
+        Schwester Petra Jung<br>
+        Beethoven Str. 2<br>
+        02763 Zittau
+      </td>
+      <td>
+        Bank: SPK Oberlausitz-Niederschlesien<br>
+        BLZ: 85050100<br>
+        Konto: 3000201199<br>
+        IBAN: DE53 8505 0100 3000 2011 99
+      </td>
+      <td>
+        Tel: 03583/702041<br>
+        Fax: 03583/795828<br>
+        Steuernummer:<br>
+        208/236/04476
+      </td>
+    </tr>
+  </table>
+</div>
 </body>
 </html>

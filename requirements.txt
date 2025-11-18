@@ -7,3 +7,10 @@ Jinja2
 requests
 PyQt5>=5.15.9
 Openai
+fastapi 
+uvicorn[standard]
+python-multipart
+python-dotenv
+keyring
+tiktoken
+chromadb

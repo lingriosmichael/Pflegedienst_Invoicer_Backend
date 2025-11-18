@@ -1,5 +1,6 @@
 import os
 import json
+import webbrowser
 import app.pdf_parser
 import app.database
 import app.invoice_generator
@@ -16,11 +17,12 @@ if __name__ == "__main__":
         print("4. Check service fields")
         print("5. Retry failed chunks")
         print("6. Regenerate an invoice")
-        print("7. Exit")
-        choice = input("Enter 1, 2, 3, 4 or 5: ").strip()
+        print("7. Open the RAG dashboard in your browser")
+        print("8. Exit")
+        choice = input("Enter 1–8: ").strip()
 
         if choice == "1":
-            text = app.pdf_parser.extract_text_from_pdf("data/abrechnung/june_2025_2.pdf")
+            text = app.pdf_parser.extract_text_from_pdf("data/abrechnung/september_2025.pdf")
             chunks = app.pdf_parser.split_into_chunks(text)
             print(f"\U0001F50D Found {len(chunks)} chunks in PDF.")
             sgbxi_entlastungsleistung = input("\U0001F4C9 sgbxi or entleistung: ").strip()            
@@ -45,6 +47,11 @@ if __name__ == "__main__":
             app.invoice_generator.regenerate_invoice(invoice_num)
 
         elif choice == "7":
+            url = "http://localhost:8000/dashboard"
+            print(f"🌐 Opening {url} (make sure the API is running).")
+            webbrowser.open(url)
+
+        elif choice == "8":
             print("👋 Exiting.")
             break
 

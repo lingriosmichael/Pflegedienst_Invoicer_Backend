@@ -357,13 +357,15 @@ def _ensure_private_rechnung_column():
         c.execute("PRAGMA table_info(invoices)")
         cols = [row[1] for row in c.fetchall()]
         if "private_rechnung" not in cols:
-            # Add column default 0 (SQLite: ADD COLUMN always appends as last column)
-            c.execute("ALTER TABLE invoices ADD COLUMN private_rechnung INTEGER DEFAULT 0")
+            # Add column as TEXT with default NULL (SQLite: ADD COLUMN always appends as last column)
+            c.execute("ALTER TABLE invoices ADD COLUMN private_rechnung TEXT DEFAULT NULL")
             conn.commit()
 
 def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = False) -> int:
     """
-    Set private_rechnung = 1 for all invoices of the given invoicing_month.
+    Set private_rechnung based on amount_owed for all invoices of the given invoicing_month.
+    - If amount_owed > 0: private_rechnung = 'invoice_needed'
+    - If amount_owed = 0: private_rechnung = 'covered_insurance'
     If only_positive=True, only mark invoices with amount_owed > 0.
     Returns number of rows updated.
     """
@@ -372,24 +374,23 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
         c = conn.cursor()
         before = conn.total_changes
 
-        if only_positive:
-            # amount_owed is TEXT with German formatting; normalize to REAL
-            c.execute(
-                """
-                UPDATE invoices
-                   SET private_rechnung = 1
-                 WHERE invoicing_month = ?
-                   AND CAST(REPLACE(REPLACE(amount_owed, '.', ''), ',', '.') AS REAL) > 0.0
-                """,
-                (invoicing_month,),
-            )
-        else:
-            c.execute(
-                "UPDATE invoices SET private_rechnung = 1 WHERE invoicing_month = ?",
-                (invoicing_month,),
-            )
+        # Update all invoices with the appropriate status based on amount_owed
+        c.execute(
+            """
+            UPDATE invoices
+               SET private_rechnung = CASE 
+                   WHEN CAST(REPLACE(REPLACE(amount_owed, '.', ''), ',', '.') AS REAL) > 0.0 
+                   THEN 'invoice_needed'
+                   WHEN CAST(REPLACE(REPLACE(amount_owed, '.', ''), ',', '.') AS REAL) = 0.0 
+                   THEN 'covered_insurance'
+                   ELSE NULL
+               END
+             WHERE invoicing_month = ?
+            """,
+            (invoicing_month,),
+        )
 
         conn.commit()
         changes = conn.total_changes - before
-        logger.info(f"Marked {changes} invoices in {invoicing_month} as ready (private_rechnung=1).")
+        logger.info(f"Marked {changes} invoices in {invoicing_month} with appropriate status (invoice_needed or covered_insurance).")
         return changes

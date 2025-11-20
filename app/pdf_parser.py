@@ -195,6 +195,17 @@ def process_import_sgbxi(text_chunks, abrechnungsmonat):
             structured["invoice"]["abrechnungsmonat"] = abrechnungsmonat
             clean_4064(structured)
 
+            # Insert chunk metadata before processing
+            if chunk_id:
+                from datetime import datetime
+                database.insert_chunk(
+                    chunk_id=chunk_id,
+                    patient_name=name,
+                    source_pdf=chunk_entry.get("source_pdf") if isinstance(chunk_entry, dict) else None,
+                    text_preview=chunk_text[:200],  # First 200 chars as preview
+                    created_at=datetime.utcnow().isoformat()
+                )
+
             for attempt in range(3):
                 try:
                     database.insert_structured_data(structured, origin_chunk_id=chunk_id)

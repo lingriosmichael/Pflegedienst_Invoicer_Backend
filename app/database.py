@@ -3,8 +3,8 @@ from datetime import datetime
 from app.db.config import enable_wal_mode
 from app.db.connection import get_db, DB_PATH
 from app.utils.parsing import GermanDecimalParser
-# Repository imports for refactored queries
-from app.db.repositories import InvoiceRepository, PatientRepository, ServiceRepository
+
+from app.db.repositories import InvoiceRepository, PatientRepository, ServiceRepository, CareRecordRepository, BillingSummaryRepository
 
 logger = logging.getLogger(__name__)
 
@@ -80,25 +80,59 @@ def init_db():
         )
         """)
         
+        # Care records table for non-billable care data (SGBV, Verhinderungspflege)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS care_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id INTEGER,
+            record_type TEXT,
+            pflegekonto TEXT,
+            care_period_begin TEXT,
+            care_period_end TEXT,
+            created_at TEXT,
+            origin_chunk_id TEXT,
+            FOREIGN KEY(patient_id) REFERENCES patients(id)
+        )
+        """)
+        
+        # Care services table for storing services related to care records
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS care_services (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            care_record_id INTEGER,
+            quantity TEXT,
+            code TEXT,
+            description TEXT,
+            unit_price TEXT,
+            total_price TEXT,
+            FOREIGN KEY(care_record_id) REFERENCES care_records(id)
+        )
+        """)
+        
+        # Billing summary table for first-page aggregate data
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS billing_summary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            abrechnungsmonat TEXT NOT NULL,
+            submitted_invoices_count INTEGER,
+            submitted_invoices_amount REAL,
+            created_at TEXT
+        )
+        """)
+        
         # Create indexes for faster queries
         c.execute("CREATE INDEX IF NOT EXISTS idx_invoices_month ON invoices(invoicing_month)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_invoices_patient ON invoices(patient_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(private_rechnung)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_invoices_month_status ON invoices(invoicing_month, private_rechnung)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_services_invoice ON services(invoice_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_care_services_record ON care_services(care_record_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_patients_insurance ON patients(insurance_number)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_care_records_patient ON care_records(patient_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_care_records_type ON care_records(record_type)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_care_records_pflegekonto ON care_records(pflegekonto)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_billing_summary_month ON billing_summary(abrechnungsmonat)")
 
-        # Minimal chunks table for RAG metadata (embeddings stored externally in Chroma)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS chunks (
-            id TEXT PRIMARY KEY,
-            patient_name TEXT,
-            source_pdf TEXT,
-            text_preview TEXT,
-            created_at TEXT
-        )
-        """)
-        c.execute("CREATE INDEX IF NOT EXISTS idx_chunks_patient ON chunks(patient_name)")
 
         conn.commit()
 
@@ -199,42 +233,103 @@ def insert_structured_data(data, origin_chunk_id: str | None = None):
         conn.commit()
 
 
-def insert_chunk(chunk_id: str, patient_name: str | None, source_pdf: str | None, text_preview: str | None, created_at: str):
+def insert_care_record(data: dict, record_type: str, pflegekonto: str, origin_chunk_id: str = None):
     """
-    Insert a minimal chunk metadata row into the chunks table.
-    Embeddings are stored externally (Chroma) and referenced by chunk_id.
+    Insert a non-billable care record (SGBV, Verhinderungspflege) with associated services.
+    
+    Args:
+        data: Dictionary with 'patient', 'services', 'invoice' keys (same as invoice structure)
+        record_type: 'SGBV' or 'Verhinderungspflege'
+        pflegekonto: Pflegekonto code (4092 or 4050)
+        origin_chunk_id: Optional chunk ID for traceability
     """
     with get_db() as conn:
         c = conn.cursor()
-        try:
-            c.execute(
-                "INSERT OR IGNORE INTO chunks (id, patient_name, source_pdf, text_preview, created_at) VALUES (?, ?, ?, ?, ?)",
-                (chunk_id, patient_name or "", source_pdf or "", text_preview or "", created_at),
-            )
-            conn.commit()
-        except Exception as e:
-            logger.error(f"Failed to insert chunk {chunk_id}: {e}")
+        
+        patient = data.get("patient", {})
+        invoice = data.get("invoice", {})
+        services = data.get("services", [])
+        
+        # Ensure patient exists
+        c.execute("""
+            INSERT OR IGNORE INTO patients (name, birthdate, insurance_number, care_level)
+            VALUES (?, ?, ?, ?)
+        """, (
+            patient.get("name"),
+            patient.get("birthdate"),
+            patient.get("insurance_number"),
+            patient.get("care_level")
+        ))
+        
+        c.execute("SELECT id FROM patients WHERE insurance_number = ?", (patient.get("insurance_number"),))
+        row = c.fetchone()
+        if not row:
+            logger.error(f"Failed to insert patient for care record: {patient.get('name')}")
+            return None
+        
+        patient_id = row[0]
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Insert care record (without services field)
+        c.execute("""
+            INSERT INTO care_records 
+            (patient_id, record_type, pflegekonto, care_period_begin, care_period_end, 
+             created_at, origin_chunk_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (patient_id, record_type, pflegekonto, invoice.get("pflegezeitraum_beginn"),
+              invoice.get("pflegezeitraum_ende"), created_at, origin_chunk_id))
+        
+        record_id = c.lastrowid
+        
+        # Insert associated services
+        for service in services:
+            c.execute("""
+                INSERT INTO care_services (care_record_id, quantity, code, description, unit_price, total_price)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                record_id,
+                service.get("quantity"),
+                service.get("code"),
+                service.get("description"),
+                service.get("unit_price"),
+                service.get("total_price")
+            ))
+        
+        conn.commit()
+        
+        logger.info(f"✓ Care record inserted: record_id={record_id}, type={record_type}, patient={patient.get('name')}, pflegekonto={pflegekonto}, services={len(services)}")
+        return record_id
 
-
-def update_chunk_patient(chunk_id: str | None, patient_name: str | None):
-    """
-    Keep chunk metadata in sync once we know the patient name.
-    """
-    if not chunk_id:
-        return
-
-    with get_db() as conn:
-        c = conn.cursor()
-        try:
-            c.execute(
-                "UPDATE chunks SET patient_name = ? WHERE id = ?",
-                (patient_name or "", chunk_id),
-            )
-            if c.rowcount == 0:
-                logger.debug(f"No chunk row updated for {chunk_id} (maybe it does not exist yet)")
-            conn.commit()
-        except Exception as e:
-            logger.error(f"Failed to update chunk {chunk_id} patient_name: {e}")
+def insert_billing_summary(data, abrechnungsmonat):
+    """Insert billing summary from first-page aggregate data."""
+    try:
+        submitted_invoices_count = data.get("submitted_invoices_count")
+        submitted_invoices_amount = data.get("submitted_invoices_amount")
+        
+        if submitted_invoices_count is None or submitted_invoices_amount is None:
+            logger.warning("Missing required billing summary fields")
+            return None
+        
+        # Convert German decimal format if needed
+        if isinstance(submitted_invoices_amount, str):
+            parser = GermanDecimalParser()
+            submitted_invoices_amount = parser.parse(submitted_invoices_amount)
+        
+        created_at = datetime.now().isoformat()
+        
+        # Insert using repository
+        summary_id = BillingSummaryRepository.insert(
+            abrechnungsmonat=abrechnungsmonat,
+            submitted_invoices_count=submitted_invoices_count,
+            submitted_invoices_amount=submitted_invoices_amount,
+            created_at=created_at
+        )
+        
+        logger.info(f"✓ Billing summary inserted: summary_id={summary_id}, month={abrechnungsmonat}, count={submitted_invoices_count}, amount={submitted_invoices_amount}")
+        return summary_id
+    except Exception as e:
+        logger.error(f"Error inserting billing summary: {e}")
+        return None
 
 def get_private_invoice_cases(invoicing_month=None, invoice_id=None):
     cases = []
@@ -252,7 +347,7 @@ def get_private_invoice_cases(invoicing_month=None, invoice_id=None):
         invoice_ids = InvoiceRepository.find_by_month(invoicing_month, private_only=True)
         for inv_id in invoice_ids:
             invoice = InvoiceRepository.find_by_id(inv_id)
-            patient = PatientRepository.find_by_insurance_number(invoice["patient_id"])
+            patient = PatientRepository.find_by_id(invoice["patient_id"])
             services = ServiceRepository.find_by_invoice_id(inv_id)
             case = {
                 "invoice": invoice,
@@ -363,9 +458,10 @@ def _ensure_private_rechnung_column():
 
 def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = False) -> int:
     """
-    Set private_rechnung based on amount_owed for all invoices of the given invoicing_month.
-    - If amount_owed > 0: private_rechnung = 'invoice_needed'
-    - If amount_owed = 0: private_rechnung = 'covered_insurance'
+    Set private_rechnung based on amount_owed and service packet flag for all invoices of the given invoicing_month.
+    - If patient has include_service_packet = 1: private_rechnung = 'invoice_needed'
+    - Else if amount_owed > 0: private_rechnung = 'invoice_needed'
+    - Else if amount_owed = 0: private_rechnung = 'covered_insurance'
     If only_positive=True, only mark invoices with amount_owed > 0.
     Returns number of rows updated.
     """
@@ -374,11 +470,13 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
         c = conn.cursor()
         before = conn.total_changes
 
-        # Update all invoices with the appropriate status based on amount_owed
+        # Update all invoices with the appropriate status based on amount_owed and service packet
         c.execute(
             """
             UPDATE invoices
                SET private_rechnung = CASE 
+                   WHEN (SELECT include_service_packet FROM patients WHERE id = invoices.patient_id) = 1
+                   THEN 'invoice_needed'
                    WHEN CAST(REPLACE(REPLACE(amount_owed, '.', ''), ',', '.') AS REAL) > 0.0 
                    THEN 'invoice_needed'
                    WHEN CAST(REPLACE(REPLACE(amount_owed, '.', ''), ',', '.') AS REAL) = 0.0 
@@ -392,5 +490,5 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
 
         conn.commit()
         changes = conn.total_changes - before
-        logger.info(f"Marked {changes} invoices in {invoicing_month} with appropriate status (invoice_needed or covered_insurance).")
+        logger.info(f"Marked {changes} invoices in {invoicing_month} with appropriate status (invoice_needed or covered_insurance). Included patients with service packet flag.")
         return changes

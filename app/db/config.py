@@ -15,7 +15,7 @@ def enable_wal_mode(db_path: str):
     Safe to call multiple times.
     """
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path, timeout=30.0)
         c = conn.cursor()
         c.execute("PRAGMA journal_mode=WAL")
         mode = c.fetchone()[0]
@@ -36,10 +36,12 @@ def get_db_connection(db_path: str) -> sqlite3.Connection:
     """
     Get a SQLite connection with recommended settings for local installs.
     """
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    # Set timeout for "database is locked" retries
-    conn.execute("PRAGMA busy_timeout=5000")  # 5 second timeout
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA cache_size = -64000")
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 

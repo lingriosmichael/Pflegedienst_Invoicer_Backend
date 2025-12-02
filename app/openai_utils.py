@@ -3,16 +3,30 @@ import json
 import hashlib
 import logging
 from typing import Optional
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# Simple file-based cache directory
-CACHE_DIR = "cache/openai"
-os.makedirs(CACHE_DIR, exist_ok=True)
+# Cache directories
+FAILURE_CACHE_DIR = "cache/openai/failures"
+os.makedirs(FAILURE_CACHE_DIR, exist_ok=True)
 
 
-def _cache_path(key: str) -> str:
-    return os.path.join(CACHE_DIR, f"{key}.json")
+def _failure_cache_path(model: str, system_prompt: str, user_text: str) -> str:
+    """Generate a descriptive cache path for failed requests."""
+    # Create hash for uniqueness
+    h = hashlib.sha256()
+    h.update(model.encode("utf-8"))
+    h.update(b"\n--SYSTEM--\n")
+    h.update(system_prompt.encode("utf-8"))
+    h.update(b"\n--USER--\n")
+    h.update(user_text.encode("utf-8"))
+    hash_key = h.hexdigest()[:8]  # Use first 8 chars for brevity
+    
+    # Create readable filename with timestamp and hash
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"failure_{timestamp}_{hash_key}.json"
+    return os.path.join(FAILURE_CACHE_DIR, filename)
 
 
 def make_cache_key(model: str, system_prompt: str, user_text: str) -> str:
@@ -26,25 +40,24 @@ def make_cache_key(model: str, system_prompt: str, user_text: str) -> str:
     return h.hexdigest()
 
 
-def get_cached_response(key: str) -> Optional[dict]:
-    path = _cache_path(key)
-    if not os.path.exists(path):
-        return None
+def cache_failed_request(model: str, system_prompt: str, user_text: str, error: str):
+    """Cache a failed request for troubleshooting."""
+    path = _failure_cache_path(model, system_prompt, user_text)
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.warning(f"Failed to read cache file {path}: {e}")
-        return None
-
-
-def set_cached_response(key: str, response_obj: dict):
-    path = _cache_path(key)
-    try:
+        failure_data = {
+            "timestamp": datetime.now().isoformat(),
+            "model": model,
+            "error": error,
+            "input": {
+                "system_prompt": system_prompt,
+                "user_text": user_text
+            }
+        }
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(response_obj, f, ensure_ascii=False, indent=2)
+            json.dump(failure_data, f, ensure_ascii=False, indent=2)
+        logger.info(f"✓ Cached failed request: {path}")
     except Exception as e:
-        logger.warning(f"Failed to write cache file {path}: {e}")
+        logger.warning(f"Failed to cache error: {e}")
 
 
 def count_tokens(text: str, model: str = "gpt-5-mini-2025-08-07") -> int:

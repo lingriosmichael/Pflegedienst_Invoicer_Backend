@@ -5,10 +5,10 @@ deactivate
 
 cd ~/Documents/pflegedienst_invoicer
 source .venv/bin/activate   # macOS / Linux
-# OR
-.venv\Scripts\activate      # Windows PowerShell
-
 
 ## Start FastAPI with Uvicorn
 
 uvicorn backend:app --reload
+
+# Or with specific host/port:
+uvicorn backend:app --reload --host 127.0.0.1 --port 8000

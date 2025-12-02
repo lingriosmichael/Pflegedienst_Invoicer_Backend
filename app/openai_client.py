@@ -7,9 +7,69 @@ import logging
 from app.database import DB_PATH
 from app.ai_schema import get_ai_schema
 from app.core.config import settings
-from app.openai_utils import make_cache_key, get_cached_response, set_cached_response, count_tokens
+from app.openai_utils import make_cache_key, cache_failed_request, count_tokens
 
 logger = logging.getLogger(__name__)
+
+# JSON Schema for single invoice object (used for both single and batch responses)
+INVOICE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "patient": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "birthdate": {"type": "string"},
+                "insurance_number": {"type": "string"},
+                "care_level": {"type": "string"},
+                "pflege_konto": {"type": "string"}
+            },
+            "required": ["name", "birthdate", "insurance_number", "care_level", "pflege_konto"],
+            "additionalProperties": False
+        },
+        "services": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "quantity": {"type": "string"},
+                    "code": {"type": "string"},
+                    "description": {"type": "string"},
+                    "unit_price": {"type": "string"},
+                    "total_price": {"type": "string"}
+                },
+                "required": ["quantity", "code", "description", "unit_price", "total_price"],
+                "additionalProperties": False
+            }
+        },
+        "invoice": {
+            "type": "object",
+            "properties": {
+                "pflegezeitraum_beginn": {"type": "string"},
+                "pflegezeitraum_ende": {"type": "string"},
+                "summe_covered": {"type": "string"},
+                "summe_total": {"type": "string"}
+            },
+            "required": ["pflegezeitraum_beginn", "pflegezeitraum_ende", "summe_covered", "summe_total"],
+            "additionalProperties": False
+        }
+    },
+    "required": ["patient", "services", "invoice"],
+    "additionalProperties": False
+}
+
+# Batch schema: object wrapper with array of invoices (required by OpenAI json_schema which needs type: "object")
+BATCH_INVOICE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "invoices": {
+            "type": "array",
+            "items": INVOICE_SCHEMA
+        }
+    },
+    "required": ["invoices"],
+    "additionalProperties": False
+}
 
 # Create OpenAI client using configured API key (from env/.env). Do NOT keep keys in source.
 client = None
@@ -207,16 +267,6 @@ def extract_structured_data_with_openai(chunk_text, retries=2):
     except Exception:
       token_count = None
 
-    # Check cache
-    try:
-      cache_key = make_cache_key(MODEL, system_prompt, chunk_text)
-      cached = get_cached_response(cache_key)
-      if cached is not None:
-        logger.info("Using cached OpenAI response")
-        return cached
-    except Exception as e:
-      logger.warning(f"OpenAI cache check failed: {e}")
-
     try:
       rsp = client.chat.completions.create(
         model=MODEL,
@@ -224,26 +274,155 @@ def extract_structured_data_with_openai(chunk_text, retries=2):
           {"role": "system", "content": system_prompt},
           {"role": "user", "content": chunk_text},
         ],
-        response_format={"type": "json_object"}  # forces valid JSON
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "invoice_record",
+                "description": "Single extracted invoice record",
+                "schema": INVOICE_SCHEMA,
+                "strict": True
+            }
+        }
       )
 
-      content = rsp.choices[0].message.content  # already a string in Chat Completions
+      content = rsp.choices[0].message.content
       parsed = json.loads(content)
-
-      # Store in cache
-      try:
-        set_cached_response(cache_key, parsed)
-      except Exception as e:
-        logger.warning(f"Failed to set OpenAI cache: {e}")
-
       return parsed
 
     except Exception as e:
-      print(f"❌ OpenAI API error: {e}")
-      logger.error(f"OpenAI API error: {e}")
+      error_msg = str(e)
+      logger.error(f"OpenAI API error (attempt {attempt + 1}/{retries + 1}): {error_msg}")
+      
+      # Cache the failed request for troubleshooting
+      cache_failed_request(MODEL, system_prompt, chunk_text, error_msg)
+      
       if attempt < retries:
-        print(f"🔁 Retry {attempt + 1} failed")
+        logger.info(f"🔁 Retrying... ({attempt + 1}/{retries})")
+      else:
+        logger.error(f"❌ All {retries + 1} attempts failed for chunk")
+  
   return None
+
+
+def extract_batch_structured_data(chunk_texts: list, retries=2):
+  """
+  Extract structured data from a batch of chunks in a single API call.
+  
+  Args:
+    chunk_texts: List of chunk text strings (max 10 recommended)
+    retries: Number of retry attempts
+    
+  Returns:
+    List of structured data objects, one per chunk. Failed chunks return None.
+  """
+  MODEL = "gpt-5-mini-2025-08-07"
+  
+  if not chunk_texts:
+    return []
+  
+  # Build combined input with clear separators
+  batch_input = ""
+  for i, chunk_text in enumerate(chunk_texts, 1):
+    batch_input += f"\n{'='*80}\nCHUNK {i}:\n{'='*80}\n{chunk_text}\n"
+  
+  for attempt in range(retries + 1):
+    system_prompt = f"""{build_prompt(attempt)}
+
+BATCH PROCESSING MODE:
+You will receive multiple billing blocks separated by "====" lines.
+For EACH block:
+1. Extract its structured JSON following the exact schema provided
+2. Return a JSON object with an "invoices" array containing one object per chunk
+
+CRITICAL REQUIREMENTS:
+- Return ONLY a valid JSON object with "invoices" key containing an array
+- Each object in the array MUST have exactly these fields in this order: "patient", "services", "invoice"
+- Patient object MUST have: name, birthdate, insurance_number, care_level, pflege_konto
+- Services array MUST contain objects with: quantity, code, description, unit_price, total_price
+- Invoice object MUST have: pflegezeitraum_beginn, pflegezeitraum_ende, summe_covered, summe_total
+- All monetary values MUST use German format: "1.234,56" (comma for decimals, dot for thousands)
+- If a chunk cannot be parsed, SKIP it entirely (do not include null)
+- Return empty invoices array [] if no chunks can be parsed
+
+Return format MUST be:
+{{
+  "invoices": [
+    {{"patient": {{"name": "...", "birthdate": "...", "insurance_number": "...", "care_level": "...", "pflege_konto": "..."}}, "services": [{{"quantity": "...", "code": "...", "description": "...", "unit_price": "...", "total_price": "..."}}], "invoice": {{"pflegezeitraum_beginn": "...", "pflegezeitraum_ende": "...", "summe_covered": "...", "summe_total": "..."}}}},
+    ...
+  ]
+}}
+
+Process all chunks sequentially in the same request.
+"""
+
+    # Token counting (best-effort)
+    try:
+      token_count = count_tokens(system_prompt + batch_input, model=MODEL)
+      logger.debug(f"Batch token estimate: {token_count} tokens (model={MODEL}, chunks={len(chunk_texts)})")
+    except Exception:
+      pass
+
+    try:
+      rsp = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+          {"role": "system", "content": system_prompt},
+          {"role": "user", "content": batch_input},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "batch_invoices",
+                "description": "Array of extracted invoice records",
+                "schema": BATCH_INVOICE_SCHEMA,
+                "strict": True
+            }
+        }
+      )
+
+      content = rsp.choices[0].message.content
+      parsed = json.loads(content)
+
+      # Ensure we always return a list
+      if isinstance(parsed, dict) and "invoices" in parsed:
+        results = parsed["invoices"]
+      elif isinstance(parsed, list):
+        results = parsed
+      else:
+        results = [parsed] if parsed else []
+
+      # VALIDATION: Check that we got results for each chunk
+      # This helps detect if LLM mixed data from multiple chunks
+      valid_results = [r for r in results if r is not None]
+      
+      if len(valid_results) != len(chunk_texts):
+        logger.warning(f"⚠️ Result count mismatch! Sent {len(chunk_texts)} chunks, got {len(valid_results)} results. Some chunks may have failed parsing.")
+      
+      # Log chunk-by-chunk mapping for verification
+      for idx, (chunk_text, result) in enumerate(zip(chunk_texts, results), 1):
+        if result:
+          patient_name = result.get("patient", {}).get("name", "UNKNOWN")
+          insurance = result.get("patient", {}).get("insurance_number", "UNKNOWN")
+          logger.debug(f"CHUNK {idx} → Patient: {patient_name} (Insurance: {insurance})")
+        else:
+          logger.debug(f"CHUNK {idx} → Failed/Skipped")
+
+      logger.info(f"✅ Batch extraction successful: {len(valid_results)}/{len(chunk_texts)} chunks extracted")
+      return results
+
+    except Exception as e:
+      error_msg = str(e)
+      logger.error(f"Batch OpenAI API error (attempt {attempt + 1}/{retries + 1}): {error_msg}")
+      
+      # Cache the failed batch request for troubleshooting
+      cache_failed_request(MODEL, system_prompt, batch_input, error_msg)
+      logger.error(f"Batch OpenAI API error: {e}")
+      if attempt < retries:
+        print(f"🔁 Batch retry {attempt + 1}...")
+  
+  logger.error(f"Batch extraction failed after {retries + 1} attempts")
+  return [None] * len(chunk_texts)
+
 
 SYSTEM_PROMPT = """
 You are an advanced AI data analyst specialized in billing and service data for German Pflegedienste (care services).
@@ -406,8 +585,11 @@ def generate_sql_from_question(question: str) -> dict:
 def execute_sql(sql: str):
     if not sql.lower().startswith("select"):
         raise ValueError("Only SELECT statements are allowed.")
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA cache_size = -64000")
     cur = conn.cursor()
     cur.execute(sql)
     rows = [dict(r) for r in cur.fetchall()]

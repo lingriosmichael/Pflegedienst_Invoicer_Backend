@@ -16,6 +16,7 @@ import app.database as database
 import app.invoice_generator as invoice_generator
 import app.pdf_parser as pdf_parser
 import app.background as background
+from app.db.migrations import migrate_care_records_to_services_table
 import uuid
 from datetime import datetime
 import asyncio, sys, logging
@@ -31,7 +32,9 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:1420",     
         "http://127.0.0.1:1420",
-        "tauri://localhost",         
+        "tauri://localhost",
+        "http://localhost:5173",      # Vite dev server
+        "http://127.0.0.1:5173",      # Vite dev server
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -43,16 +46,22 @@ templates = Jinja2Templates(directory="templates")
 UPLOAD_DIR = "data/abrechnung"
 
 def _prepare_chunks_for_file(file_name: str, abrechnungsmonat: str):
-    """Extract chunks, cache them, and enqueue indexing tasks."""
+    """Extract and cache PDF chunks for processing."""
     path = os.path.join(UPLOAD_DIR, file_name)
     text = pdf_parser.extract_text_from_pdf(path)
+    
+    # Extract billing summary from first page
+    first_page_text = pdf_parser.extract_first_page_text(path)
+    billing_summary = pdf_parser.extract_billing_summary(first_page_text)
+    if billing_summary:
+        database.insert_billing_summary(billing_summary, abrechnungsmonat)
+    
     raw_chunks = pdf_parser.split_into_chunks(text)
     now_ts = datetime.now().isoformat()
 
     chunk_entries = []
     for chunk_text in raw_chunks:
         cid = str(uuid.uuid4())
-        preview = (chunk_text or "")[:300]
         chunk_entry = {
             "chunk_id": cid,
             "text": chunk_text,
@@ -60,20 +69,9 @@ def _prepare_chunks_for_file(file_name: str, abrechnungsmonat: str):
             "patient_name": None,
             "created_at": now_ts,
         }
-
-        try:
-            database.insert_chunk(cid, None, file_name, preview, now_ts)
-        except Exception:
-            logger.exception("Failed to insert chunk metadata during preparation")
-
         chunk_entries.append(chunk_entry)
 
     pdf_parser.store_chunks_temp(abrechnungsmonat, chunk_entries)
-    try:
-        background.enqueue_index_chunks(chunk_entries)
-    except Exception:
-        logger.exception("Failed to enqueue chunks for background indexing")
-
     return chunk_entries
 
 # ------------------------------
@@ -82,19 +80,13 @@ def _prepare_chunks_for_file(file_name: str, abrechnungsmonat: str):
 class ProcessRequest(BaseModel):
     file_name: str
     abrechnungsmonat: str
-    mode: str   # "sgbxi" or "entleistung"
+    mode: str   # "sgbxi", "sgbv", "verhinderungspflege", or "entleistung"
 
 class InvoiceRequest(BaseModel):
     abrechnungsmonat: str
 
 class RegenerateRequest(BaseModel):
     invoice_num: str
-
-
-class AgentRequest(BaseModel):
-    question: str
-    patient_name: str | None = None
-    k: int = 4
 
 
 # ------------------------------
@@ -104,19 +96,10 @@ class AgentRequest(BaseModel):
 async def startup_event():
     try:
         database.init_db()
+        # Run migration for existing databases
+        migrate_care_records_to_services_table()
     except Exception as e:
         logger.error(f"Failed to init database: {e}")
-    
-    # start background worker for RAG indexing in a separate thread (non-blocking)
-    import threading
-    def start_bg_worker():
-        try:
-            background.start_worker()
-        except Exception as e:
-            logger.error(f"Failed to start background worker: {e}")
-    
-    worker_thread = threading.Thread(target=start_bg_worker, daemon=True)
-    worker_thread.start()
 
 
 # ------------------------------
@@ -134,6 +117,9 @@ def upload_pdf(file: UploadFile = File(...), abrechnungsmonat: str = Form(...)):
 
 @app.post("/generate_invoices")
 def generate_invoices(req: InvoiceRequest):
+    # First mark invoices ready based on amount_owed and service packet flag
+    database.mark_month_ready_for_generation(req.abrechnungsmonat)
+    # Then generate the invoices
     invoice_generator.process_generate_invoices(req.abrechnungsmonat)
     return {"status": "ok", "message": "Rechnungen erstellt"}
 
@@ -176,87 +162,7 @@ def prepare_pdf(req: ProcessRequest):
     }
 
 
-@app.post("/rag/query")
-def rag_query(request: Request):
-    """Retrieve nearest chunks from the RAG index.
 
-    Body: { question: str, patient_name?: str, k?: int }
-    """
-    body = request.json() if hasattr(request, "json") else None
-    # In FastAPI sync handler, request.json() is coroutine normally; we'll use starlette request object
-    try:
-        import json as _json
-        body_bytes = request._body if hasattr(request, "_body") and request._body else None
-    except Exception:
-        body_bytes = None
-
-    try:
-        payload = asyncio.get_event_loop().run_until_complete(request.json())
-    except Exception:
-        # fallback: empty payload
-        payload = {}
-
-    question = payload.get("question")
-    patient_name = payload.get("patient_name")
-    k = int(payload.get("k", 5))
-
-    if not question:
-        raise HTTPException(status_code=400, detail="Missing 'question' in request body")
-
-    from app.rag_store import RagStore
-
-    try:
-        rag = RagStore()
-        where = {"patient_name": patient_name} if patient_name else None
-        results = rag.query(question, k=k, where=where)
-        # For each result, fetch chunk metadata from DB
-        out = []
-        from app.db.connection import get_db
-        with get_db() as conn:
-            c = conn.cursor()
-            for r in results:
-                cid = r.get("chunk_id")
-                c.execute("SELECT id, patient_name, source_pdf, text_preview, created_at FROM chunks WHERE id = ?", (cid,))
-                row = c.fetchone()
-                out.append({
-                    "chunk_id": cid,
-                    "score": r.get("score"),
-                    "metadata": r.get("metadata"),
-                    "text": r.get("text"),
-                    "db_row": {
-                        "id": row[0] if row else None,
-                        "patient_name": row[1] if row else None,
-                        "source_pdf": row[2] if row else None,
-                        "text_preview": row[3] if row else None,
-                        "created_at": row[4] if row else None,
-                    }
-                })
-
-        return {"status": "ok", "results": out}
-    except Exception as e:
-        logger.error(f"RAG query failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/agent/query")
-def agent_query(req: AgentRequest):
-    """Agent endpoint: retrieves chunks and synthesizes an answer."""
-    if req.k < 1:
-        raise HTTPException(status_code=400, detail="k must be >= 1")
-    try:
-        from app.agent import run_agent
-        result = run_agent(
-            req.question,
-            patient_name=req.patient_name,
-            k=req.k
-        )
-        return {"status": "ok", "result": result}
-    except RuntimeError as e:
-        logger.error(f"Agent query requires OpenAI configuration: {e}")
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Agent query failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -341,8 +247,8 @@ def browse_chunks(request: Request, patient_name: str | None = None):
 @app.post("/process_pdf")
 def process_pdf(req: ProcessRequest):
     """
-    Step 2: User selects a mode (sgbxi or entlastungsleistung).
-    Reuses cached chunks → filters → imports.
+    Step 2: User selects a mode (sgbxi, sgbv, verhinderungspflege, or entleistung).
+    Reuses cached chunks → filters by Pflegekonto → imports to appropriate table.
     """
     chunks = pdf_parser.get_chunks_temp(req.abrechnungsmonat)
     if not chunks:
@@ -350,7 +256,18 @@ def process_pdf(req: ProcessRequest):
         chunks = _prepare_chunks_for_file(req.file_name, req.abrechnungsmonat)
 
     filtered = pdf_parser.filter_chunks_by_mode(chunks, req.mode)
-    pdf_parser.process_import_sgbxi(filtered, req.abrechnungsmonat)
+    
+    # Route to appropriate processing function based on mode
+    if req.mode == "sgbxi":
+        pdf_parser.process_import_sgbxi(filtered, req.abrechnungsmonat)
+    elif req.mode == "sgbv":
+        pdf_parser.process_import_sgbv(filtered, req.abrechnungsmonat)
+    elif req.mode == "verhinderungspflege":
+        pdf_parser.process_import_verhinderungspflege(filtered, req.abrechnungsmonat)
+    elif req.mode == "entleistung":
+        pdf_parser.process_import_sgbxi(filtered, req.abrechnungsmonat)  # Special 4064 handling in process_import_sgbxi
+    else:
+        raise ValueError(f"Unknown processing mode: {req.mode}")
 
     return {
         "status": "processed",
@@ -584,9 +501,55 @@ def delete_patient(patient_id: int):
         logger.error(f"/patient DELETE error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ==============================
+# Predefined Analytics Dashboard
+# ==============================
+
+class PatientHistogramRequest(BaseModel):
+    patient_id: int
+
+@app.get("/analytics/patients")
+def get_patients():
+    """Get list of all patients for dashboard sidebar."""
+    try:
+        from app.chart_generator import get_all_patients
+        
+        patients = get_all_patients()
+        
+        return {
+            "status": "ok",
+            "patients": patients
+        }
+    except Exception as e:
+        logger.error(f"Patients fetch error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/analytics/patient/{patient_id}/histogram")
+def get_patient_histogram(patient_id: int):
+    """Generate histogram of invoice amounts by month for a patient."""
+    try:
+        from app.chart_generator import generate_patient_histogram
+        
+        chart_data = generate_patient_histogram(patient_id)
+        
+        return {
+            "status": "ok",
+            "chart_data": chart_data
+        }
+    except Exception as e:
+        logger.error(f"Histogram generation error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+        
+        return {
+            "status": "ok",
+            "message": "Patients and histogram data retrieved"
+        }
+
+
 # ------------------------------
 # Root
 # ------------------------------
 @app.get("/")
 def root():
     return {"message": "Pflegedienst Jung API is running"}
+

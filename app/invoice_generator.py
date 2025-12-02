@@ -7,8 +7,12 @@ from datetime import datetime
 from app.database import get_private_invoice_cases
 # Future: from app.db.repositories import InvoiceRepository, PatientRepository, ServiceRepository
 from collections import defaultdict
+import signal
 
 logger = logging.getLogger(__name__)
+
+# Disable HarfBuzz assertions to prevent crashes on macOS
+os.environ['HARFBUZZ_DEBUG'] = '0'
 
 TEMPLATE_DIR = "templates"
 OUTPUT_DIR = "output/invoices"
@@ -47,15 +51,20 @@ def group_services(services):
             code = service["code"]
             description = service["description"].strip()
             quantity = float(str(service["quantity"]).replace(",", "."))
-            unit_price_float = parse_price(service["unit_price"])
-            total_price_float = parse_price(service["total_price"])
+            
+            # Handle missing or empty prices - set to 0
+            unit_price_str = service.get("unit_price", "0") or "0"
+            total_price_str = service.get("total_price", "0") or "0"
+            
+            unit_price_float = parse_price(unit_price_str) if unit_price_str else 0.0
+            total_price_float = parse_price(total_price_str) if total_price_str else 0.0
 
             key = (code, description, f"{unit_price_float:.2f}")
 
             grouped_service = grouped[key]
             grouped_service["code"] = code
             grouped_service["description"] = description
-            grouped_service["unit_price"] = f"{unit_price_float:.2f}".replace(".", ",")
+            grouped_service["unit_price"] = f"{unit_price_float:.2f}".replace(".", ",") if unit_price_float > 0 else ""
             grouped_service["quantity"] += quantity
             grouped_service["total_price"] += total_price_float
 
@@ -67,7 +76,7 @@ def group_services(services):
         "description": v["description"],
         "quantity": str(int(v["quantity"])) if v["quantity"].is_integer() else f"{v['quantity']:.2f}",
         "unit_price": v["unit_price"],
-        "total_price": f"{v['total_price']:.2f}".replace(".", ",")
+        "total_price": f"{v['total_price']:.2f}".replace(".", ",") if v["total_price"] > 0 else ""
     } for v in grouped.values()]
 
 def generate_invoice_pdf(data):    
@@ -92,7 +101,18 @@ def generate_invoice_pdf(data):
     raw_name = data['patient']['name']
     formatted_name = raw_name.replace(" ", "").replace(",", "_")
     output_path = os.path.join(OUTPUT_DIR, f"RE_{data['invoice']['invoice_number']}_{formatted_name}.pdf")
-    HTML(string=html_content).write_pdf(output_path)
+    
+    try:
+        HTML(string=html_content).write_pdf(output_path)
+    except SystemExit:
+        # HarfBuzz can cause SystemExit on certain font operations
+        # Try again with a simpler approach
+        logger.warning(f"PDF generation failed with SystemExit, retrying for {output_path}")
+        try:
+            HTML(string=html_content).write_pdf(output_path)
+        except Exception as e:
+            logger.error(f"Failed to generate PDF on retry: {e}")
+            raise
 
     return output_path
 
@@ -109,15 +129,8 @@ def process_generate_invoices(invoicing_month=None):
             if not current_number:
                 assigned_number = InvoiceRepository.get_next_invoice_number()
                 case["invoice"]["invoice_number"] = assigned_number
-                # Update in DB
-                from app.db.connection import get_db
-                with get_db() as conn:
-                    c = conn.cursor()
-                    c.execute("UPDATE invoices SET invoice_number = ? WHERE id = ?", (
-                        assigned_number,
-                        invoice_id
-                    ))
-                    conn.commit()
+                # Update in DB using repository
+                InvoiceRepository.update_invoice_number(invoice_id, assigned_number)
 
             path = generate_invoice_pdf(case)
             logger.info(f"PDF created: {path}")
@@ -127,7 +140,10 @@ def process_generate_invoices(invoicing_month=None):
             logger.error(f"PDF failed for invoice {invoice_number}: {e}")
 
 def regenerate_invoice(invoice_number):
-    conn = sqlite3.connect("data/invoices.db")
+    conn = sqlite3.connect("data/invoices.db", timeout=30.0)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA cache_size = -64000")
     c = conn.cursor()
 
     # Fetch invoice_id for the given invoice_number

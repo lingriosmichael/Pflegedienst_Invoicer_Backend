@@ -5,12 +5,12 @@ Pillow
 WeasyPrint
 Jinja2
 requests
-PyQt5>=5.15.9
-Openai
 fastapi 
 uvicorn[standard]
 python-multipart
 python-dotenv
+pydantic-settings
 keyring
-tiktoken
-chromadb
+plotly
+pandas
+numpy

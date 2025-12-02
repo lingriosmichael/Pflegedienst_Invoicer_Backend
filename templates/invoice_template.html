@@ -102,7 +102,7 @@
 
   <div class="invoice-title">Abrechnung</div>
   <div class="info-block">
-    <p>für den Zeitraum vom <strong>{{ invoice.pflegezeitraum_beginn }}</strong> bis <strong>{{ invoice.pflegezeitraum_ende }}</strong></p>
+    <p>für den Zeitraum vom <strong>{{ invoice.care_range_begin }}</strong> bis <strong>{{ invoice.care_range_end }}</strong></p>
     <p><strong>{{ patient.name }}, geb. am {{ patient.birthdate }}</strong></p>
     <p>{{ address_line1 }}, {{ address_line2 }}</p>
   </div>
@@ -112,9 +112,9 @@
     <p>Pflegegrad: <strong>{{ patient.care_level }}</strong> Ambulant</p>
   </div>
 
-  {% set pflegesumme = invoice.summe_total | float %}
+  {% set pflegesumme = invoice.sum_total | float %}
   {% set invest = pflegesumme * 0.06 %}
-  {% set covered = invoice.summe_covered | float %}
+  {% set covered = invoice.sum_covered | float %}
   {# Use per-patient flag stored in the database to determine service packet inclusion #}
   {% set needs_service_paket = (patient.include_service_packet | int) == 1 %}
   {% set service_fee = 40.00 if needs_service_paket else 0.00 %}
@@ -139,8 +139,8 @@
         <td>{{ item.code }}</td>
         <td>{{ item.description }}</td>
         <td>{{ item.quantity }}</td>
-        <td>{{ item.unit_price }} EUR</td>
-        <td>{{ item.total_price }} EUR</td>
+        <td>{% if item.unit_price %}{{ item.unit_price }} EUR{% endif %}</td>
+        <td>{% if item.total_price %}{{ item.total_price }} EUR{% endif %}</td>
       </tr>
       {% endfor %}
       <tr>
@@ -155,7 +155,7 @@
         <td>Abzug Pflegegrad</td>
         <td></td>
         <td></td>
-        <td>-{{ "%.2f"|format(invoice.summe_covered|float) }} EUR</td>
+        <td>-{{ "%.2f"|format(invoice.sum_covered|float) }} EUR</td>
       </tr>
       {% if needs_service_paket %}
       <tr>

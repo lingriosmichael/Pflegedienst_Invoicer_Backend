@@ -6,8 +6,12 @@ from app.database import DB_PATH
 router = APIRouter(prefix="/ai", tags=["ai"])
 
 def _connect():
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=30.0)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode = WAL")
+    con.execute("PRAGMA synchronous = NORMAL")
+    con.execute("PRAGMA cache_size = -64000")
+    con.execute("PRAGMA foreign_keys = ON")
     return con
 
 def _list_tables(cur) -> List[str]:

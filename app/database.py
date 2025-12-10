@@ -458,10 +458,16 @@ def _ensure_private_rechnung_column():
 
 def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = False) -> int:
     """
-    Set private_rechnung based on amount_owed and service packet flag for all invoices of the given invoicing_month.
+    Set private_rechnung based on sum_covered value for all invoices of the given invoicing_month.
+    Unified logic for all care accounts (SGBXI, Entleistung, etc.):
     - If patient has include_service_packet = 1: private_rechnung = 'invoice_needed'
-    - Else if amount_owed > 0: private_rechnung = 'invoice_needed'
-    - Else if amount_owed = 0: private_rechnung = 'covered_insurance'
+    - Else if sum_covered < sum_total: private_rechnung = 'invoice_needed' (has out-of-pocket costs)
+    - Else if sum_covered = sum_total: private_rechnung = 'covered_insurance' (fully covered)
+    
+    For 4064 (Entleistung): sum_covered is capped at 127.35, so:
+    - If total <= 127.35: sum_covered = total → 'covered_insurance'
+    - If total > 127.35: sum_covered = 127.35 → 'invoice_needed'
+    
     If only_positive=True, only mark invoices with amount_owed > 0.
     Returns number of rows updated.
     """
@@ -470,16 +476,17 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
         c = conn.cursor()
         before = conn.total_changes
 
-        # Update all invoices with the appropriate status based on amount_owed and service packet
+        # Unified logic: use sum_covered to determine private_rechnung status for ALL invoices
+        # Works for SGBXI, Entleistung, and all other care accounts
         c.execute(
             """
             UPDATE invoices
                SET private_rechnung = CASE 
                    WHEN (SELECT include_service_packet FROM patients WHERE id = invoices.patient_id) = 1
                    THEN 'invoice_needed'
-                   WHEN CAST(REPLACE(REPLACE(amount_owed, '.', ''), ',', '.') AS REAL) > 0.0 
+                   WHEN CAST(REPLACE(REPLACE(sum_covered, '.', ''), ',', '.') AS REAL) < CAST(REPLACE(REPLACE(sum_total, '.', ''), ',', '.') AS REAL)
                    THEN 'invoice_needed'
-                   WHEN CAST(REPLACE(REPLACE(amount_owed, '.', ''), ',', '.') AS REAL) = 0.0 
+                   WHEN CAST(REPLACE(REPLACE(sum_covered, '.', ''), ',', '.') AS REAL) = CAST(REPLACE(REPLACE(sum_total, '.', ''), ',', '.') AS REAL)
                    THEN 'covered_insurance'
                    ELSE NULL
                END
@@ -490,5 +497,5 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
 
         conn.commit()
         changes = conn.total_changes - before
-        logger.info(f"Marked {changes} invoices in {invoicing_month} with appropriate status (invoice_needed or covered_insurance). Included patients with service packet flag.")
+        logger.info(f"Marked {changes} invoices in {invoicing_month} with appropriate status based on sum_covered value (applies to all care accounts).")
         return changes

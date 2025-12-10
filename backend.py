@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi import HTTPException
 from app.ai_schema import router as ai_schema_router
@@ -11,15 +11,16 @@ from app.openai_client import (
                                generate_visualization
                                )
 import traceback
-import shutil, os
+import shutil
+import os
+import asyncio
 import app.database as database
 import app.invoice_generator as invoice_generator
 import app.pdf_parser as pdf_parser
-import app.background as background
 from app.db.migrations import migrate_care_records_to_services_table
 import uuid
 from datetime import datetime
-import asyncio, sys, logging
+import logging
 from app.core.logging import setup_logging, get_logger
 
 logger = get_logger(__name__)

@@ -1,5 +1,4 @@
 import os
-import sqlite3  # Only used for legacy code, refactored to use repositories
 import logging
 from jinja2 import Environment, FileSystemLoader
 from weasyprint import HTML

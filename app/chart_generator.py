@@ -12,10 +12,10 @@ logger = get_logger(__name__)
 def generate_patient_histogram(patient_id: int) -> Dict[str, Any]:
     """
     Generate histogram of invoice amounts by month for a specific patient.
-    Direct SQL query grouped by month and care_account type.
+    Direct SQL query grouped by care_range_begin month and care_account type.
     
     SGBXI: care_account in (4010, 4020)
-    Entleisung: care_account = 4064
+    Entleistung: care_account = 4064
     
     Args:
         patient_id: The ID of the patient to generate the histogram for
@@ -24,15 +24,17 @@ def generate_patient_histogram(patient_id: int) -> Dict[str, Any]:
         Dictionary with data array ready for charting
     """
     try:
+        from datetime import datetime
+        
         with get_db() as conn:
             c = conn.cursor()
             
             # Get all invoices for this patient
             c.execute("""
-                SELECT invoicing_month, care_account, sum_total
+                SELECT care_range_begin, care_account, sum_total
                 FROM invoices
                 WHERE patient_id = ?
-                ORDER BY invoicing_month
+                ORDER BY care_range_begin
             """, (patient_id,))
             
             rows = c.fetchall()
@@ -46,9 +48,10 @@ def generate_patient_histogram(patient_id: int) -> Dict[str, Any]:
             
             # Group by month and account type
             month_data = {}
+            years_present = set()
             
             for row in rows:
-                month, care_account, sum_total = row
+                date_str, care_account, sum_total = row
                 
                 # Convert sum_total to float
                 try:
@@ -56,41 +59,49 @@ def generate_patient_histogram(patient_id: int) -> Dict[str, Any]:
                 except (ValueError, TypeError):
                     amount = 0.0
                 
+                # Parse date from DD.MM.YY format
+                try:
+                    dt = datetime.strptime(date_str, "%d.%m.%y")
+                    month_key = dt.strftime("%m%Y")
+                    month_display = dt.strftime("%m/%Y")
+                    year = dt.strftime("%Y")
+                    years_present.add(year)
+                except (ValueError, TypeError):
+                    logger.warning(f"Could not parse date: {date_str}")
+                    continue
+                
                 # Classify by care_account
                 if care_account in ("4010", "4020"):
                     account_type = "SGBXI"
                 elif care_account == "4064":
-                    account_type = "Entleisung"
+                    account_type = "Entleistung"
                 else:
                     account_type = "Other"
                 
-                if month not in month_data:
-                    month_data[month] = {}
+                if month_key not in month_data:
+                    month_data[month_key] = {"display": month_display, "data": {}}
                 
-                if account_type not in month_data[month]:
-                    month_data[month][account_type] = 0.0
+                if account_type not in month_data[month_key]["data"]:
+                    month_data[month_key]["data"][account_type] = 0.0
                 
-                month_data[month][account_type] += amount
+                month_data[month_key]["data"][account_type] += amount
+            
+            # Fill in all 12 months for each year present
+            if years_present:
+                for year in sorted(years_present):
+                    for month_num in range(1, 13):
+                        month_key = f"{month_num:02d}{year}"
+                        if month_key not in month_data:
+                            month_display = f"{month_num:02d}/{year}"
+                            month_data[month_key] = {"display": month_display, "data": {}}
             
             # Convert to array format for charting
             chart_data = []
-            
-            # Determine the year from the data (use first month's year)
-            if month_data:
-                first_month = list(month_data.keys())[0]
-                year = first_month[2:6] if len(first_month) >= 6 else "2025"
-            else:
-                year = "2025"
-            
-            # Create entries for all 12 months
-            for month_num in range(1, 13):
-                month_str = f"{month_num:02d}{year}"
-                formatted_month = f"{month_num:02d}/{year}"
-                
+            for month_key in sorted(month_data.keys()):
                 entry = {
-                    "month": formatted_month,
-                    "SGBXI": round(month_data.get(month_str, {}).get("SGBXI", 0), 2),
-                    "Entleisung": round(month_data.get(month_str, {}).get("Entleisung", 0), 2),
+                    "month": month_data[month_key]["display"],
+                    "SGBXI": round(month_data[month_key]["data"].get("SGBXI", 0), 2),
+                    "Entleistung": round(month_data[month_key]["data"].get("Entleistung", 0), 2),
                 }
                 chart_data.append(entry)
             

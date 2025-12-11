@@ -138,37 +138,3 @@ def process_generate_invoices(invoicing_month=None):
             invoice_number = case["invoice"].get("invoice_number", "[unknown]")
             logger.error(f"PDF failed for invoice {invoice_number}: {e}")
 
-def regenerate_invoice(invoice_number):
-    conn = sqlite3.connect("data/invoices.db", timeout=30.0)
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA cache_size = -64000")
-    c = conn.cursor()
-
-    # Fetch invoice_id for the given invoice_number
-    c.execute("SELECT id FROM invoices WHERE invoice_number = ?", (invoice_number,))
-    result = c.fetchone()
-
-    if not result:
-        logger.error(f"No invoice found with number {invoice_number}.")
-        conn.close()
-        return
-
-    invoice_id = result[0]
-    cases = get_private_invoice_cases(invoice_id=invoice_id)
-
-    if not cases:
-        logger.error(f"No data found for invoice {invoice_number}.")
-        conn.close()
-        return
-
-    # There should be only one case
-    case = cases[0]
-
-    try:
-        path = generate_invoice_pdf(case)
-        logger.info(f"PDF regenerated: {path}")
-    except Exception as e:
-        logger.error(f"PDF regeneration failed for invoice {invoice_number}: {e}")
-
-    conn.close()

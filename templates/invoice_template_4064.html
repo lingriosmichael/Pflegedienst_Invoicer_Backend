@@ -112,10 +112,9 @@
     <p>Pflegegrad: <strong>{{ patient.care_level }}</strong> Ambulant</p>
   </div>
 
-  {% set pflegesumme = invoice.sum_total | float %}
-  {% set covered = invoice.sum_covered | float %}
-  {% set final_total = pflegesumme - covered %}
-  {% set final_total_str = ("%0.2f"|format(final_total)) %}
+  {% set covered = invoice.sum_covered | replace('.', '') | replace(',', '.') | float %}
+  {% set amount_owed = invoice.amount_owed | replace('.', '') | replace(',', '.') | float %}
+  {% set final_total_str = ("%0.2f"|format(amount_owed)).replace('.', ',') %}
 
   <br><br><br>
   <table>
@@ -141,7 +140,9 @@
       <tr>
         <td></td>
         <td>Abzug Pflegegrad</td>
-        <td>-{{ "%.2f"|format(invoice.sum_covered|float) }} EUR</td>
+        <td></td>
+        <td>-{{ "%.2f"|format(covered) | replace('.', ',') }} EUR</td>
+        <td></td>
       </tr>
     </tbody>
   </table>

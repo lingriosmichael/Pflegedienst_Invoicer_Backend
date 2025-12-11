@@ -370,12 +370,17 @@ class BillingSummaryRepository:
     
     @staticmethod
     def insert(abrechnungsmonat: str, submitted_invoices_count: int, submitted_invoices_amount: float, created_at: str = None):
-        """Insert a billing summary record."""
+        """Insert a billing summary record if it doesn't already exist."""
         if created_at is None:
             created_at = datetime.now().isoformat()
         
         with get_db() as conn:
             c = conn.cursor()
+            # Check if month already exists
+            c.execute("SELECT id FROM billing_summary WHERE abrechnungsmonat = ?", (abrechnungsmonat,))
+            if c.fetchone():
+                return None  # Already exists, skip insert
+            
             c.execute("""
                 INSERT INTO billing_summary (abrechnungsmonat, submitted_invoices_count, submitted_invoices_amount, created_at)
                 VALUES (?, ?, ?, ?)

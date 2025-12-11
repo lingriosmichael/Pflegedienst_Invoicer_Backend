@@ -464,9 +464,9 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
     - Else if sum_covered < sum_total: private_rechnung = 'invoice_needed' (has out-of-pocket costs)
     - Else if sum_covered = sum_total: private_rechnung = 'covered_insurance' (fully covered)
     
-    For 4064 (Entleistung): sum_covered is capped at 127.35, so:
-    - If total <= 127.35: sum_covered = total → 'covered_insurance'
-    - If total > 127.35: sum_covered = 127.35 → 'invoice_needed'
+    For 4064 (Entleistung): sum_covered is capped at 127.50, so:
+    - If total <= 127.50: sum_covered = total → 'covered_insurance'
+    - If total > 127.50: sum_covered = 127.50 → 'invoice_needed'
     
     If only_positive=True, only mark invoices with amount_owed > 0.
     Returns number of rows updated.

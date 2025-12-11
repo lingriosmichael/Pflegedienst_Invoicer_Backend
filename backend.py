@@ -116,6 +116,123 @@ def upload_pdf(file: UploadFile = File(...), abrechnungsmonat: str = Form(...)):
 
     return {"status": "stored", "filename": file.filename}
 
+@app.get("/previous_imports")
+def get_previous_imports():
+    """Get list of previously imported PDF files from data/abrechnung/"""
+    import hashlib
+    from pathlib import Path
+    
+    abrechnung_dir = Path("data/abrechnung")
+    if not abrechnung_dir.exists():
+        return {"files": []}
+    
+    files = []
+    for pdf_file in sorted(abrechnung_dir.glob("*.pdf"), reverse=True):
+        try:
+            # Calculate file hash for tracking
+            with open(pdf_file, "rb") as f:
+                file_hash = hashlib.md5(f.read()).hexdigest()
+            
+            files.append({
+                "filename": pdf_file.name,
+                "filepath": str(pdf_file),
+                "file_hash": file_hash,
+                "size": pdf_file.stat().st_size,
+                "modified": pdf_file.stat().st_mtime
+            })
+        except Exception as e:
+            logger.warning(f"Could not read file {pdf_file}: {e}")
+    
+    return {"files": files}
+
+@app.post("/reimport_pdf")
+def reimport_pdf(filename: str = Form(...), abrechnungsmonat: str = Form(...), import_mode: str = Form("sgbxi")):
+    """Re-import a previously imported PDF file"""
+    import hashlib
+    from pathlib import Path
+    
+    pdf_path = Path("data/abrechnung") / filename
+    
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+    
+    try:
+        # Calculate file hash
+        with open(pdf_path, "rb") as f:
+            file_hash = hashlib.md5(f.read()).hexdigest()
+        
+        # Process the PDF using the standard flow
+        logger.info(f"Starting re-import of {filename} (mode: {import_mode}, month: {abrechnungsmonat})")
+        
+        # Step 1: Prepare chunks (extract, split, cache)
+        text = pdf_parser.extract_text_from_pdf(str(pdf_path))
+        
+        # Extract billing summary from first page
+        first_page_text = pdf_parser.extract_first_page_text(str(pdf_path))
+        billing_summary = pdf_parser.extract_billing_summary(first_page_text)
+        if billing_summary:
+            database.insert_billing_summary(billing_summary, abrechnungsmonat)
+        
+        raw_chunks = pdf_parser.split_into_chunks(text)
+        now_ts = datetime.now().isoformat()
+        
+        chunk_entries = []
+        for chunk_text in raw_chunks:
+            cid = str(uuid.uuid4())
+            chunk_entry = {
+                "chunk_id": cid,
+                "text": chunk_text,
+                "source_pdf": filename,
+                "patient_name": None,
+                "created_at": now_ts,
+            }
+            chunk_entries.append(chunk_entry)
+        
+        pdf_parser.store_chunks_temp(abrechnungsmonat, chunk_entries)
+        logger.info(f"Prepared PDF: {len(chunk_entries)} chunks")
+        
+        # Step 2: Filter and process by mode
+        filtered = pdf_parser.filter_chunks_by_mode(chunk_entries, import_mode)
+        logger.info(f"Filtered chunks: {len(filtered)} chunks for mode '{import_mode}'")
+        
+        # Route to appropriate processing function based on mode
+        inserted = 0
+        if import_mode == "sgbxi":
+            inserted = pdf_parser.process_import_sgbxi(filtered, abrechnungsmonat)
+        elif import_mode == "sgbv":
+            inserted = pdf_parser.process_import_sgbv(filtered, abrechnungsmonat)
+        elif import_mode == "verhinderungspflege":
+            inserted = pdf_parser.process_import_verhinderungspflege(filtered, abrechnungsmonat)
+        elif import_mode == "entleistung":
+            # Entleistung also uses process_import_sgbxi (special handling in filter_chunks_by_mode)
+            inserted = pdf_parser.process_import_sgbxi(filtered, abrechnungsmonat)
+        else:
+            raise ValueError(f"Unknown processing mode: {import_mode}")
+        
+        # Record the import
+        database.record_file_import(
+            filename=filename,
+            abrechnungsmonat=abrechnungsmonat,
+            import_mode=import_mode,
+            file_hash=file_hash,
+            invoice_count=inserted
+        )
+        
+        logger.info(f"✓ Re-import complete: {inserted} invoices processed from {filename}")
+        
+        return {
+            "status": "success",
+            "filename": filename,
+            "inserted": inserted,
+            "mode": import_mode,
+            "abrechnungsmonat": abrechnungsmonat
+        }
+        
+    except Exception as e:
+        logger.error(f"Error re-importing {filename}: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/generate_invoices")
 def generate_invoices(req: InvoiceRequest):
     # First mark invoices ready based on amount_owed and service packet flag
@@ -540,11 +657,345 @@ def get_patient_histogram(patient_id: int):
     except Exception as e:
         logger.error(f"Histogram generation error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/billing-summary")
+def get_billing_summary():
+    """Get billing summary data for all months."""
+    try:
+        from app.db.connection import get_db
+        
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT abrechnungsmonat, submitted_invoices_count, submitted_invoices_amount, created_at
+                FROM billing_summary
+                ORDER BY abrechnungsmonat ASC
+            """)
+            rows = c.fetchall()
+            
+            # Build a map of existing data
+            data_map = {}
+            year_set = set()
+            for row in rows:
+                month, count, amount, created_at = row
+                # Parse month format MMYYYY
+                if len(month) == 6:
+                    month_num = month[:2]
+                    year = month[2:]
+                    data_map[month] = {
+                        "month": f"{month_num}/{year}",
+                        "count": count,
+                        "amount": float(str(amount).replace(",", ".")) if amount else 0.0,
+                    }
+                    year_set.add(year)
+            
+            # If we have data, fill in all months for the years present
+            if year_set:
+                data = []
+                for year in sorted(year_set):
+                    for month_num in range(1, 13):
+                        month_key = f"{month_num:02d}{year}"
+                        if month_key in data_map:
+                            data.append(data_map[month_key])
+                        else:
+                            # Add empty month
+                            data.append({
+                                "month": f"{month_num:02d}/{year}",
+                                "count": 0,
+                                "amount": 0.0,
+                            })
+            else:
+                data = []
+            
+            return {
+                "status": "ok",
+                "data": data
+            }
+    except Exception as e:
+        logger.error(f"Billing summary error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/sgbv")
+def get_sgbv_data():
+    """Get SGB V (care_account 4092) care record data grouped by month."""
+    try:
+        from app.db.connection import get_db
+        from datetime import datetime
+        
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT 
+                    cr.care_period_begin,
+                    COUNT(DISTINCT cr.id) as record_count,
+                    SUM(CAST(REPLACE(COALESCE(cs.total_price, '0'), ',', '.') AS REAL)) as total_amount
+                FROM care_records cr
+                LEFT JOIN care_services cs ON cr.id = cs.care_record_id
+                WHERE cr.pflegekonto = '4092'
+                GROUP BY cr.care_period_begin
+                ORDER BY cr.care_period_begin ASC
+            """)
+            rows = c.fetchall()
+            
+            # Build result data, parsing DD.MM.YY format and grouping by month
+            month_data = {}
+            years_present = set()
+            
+            for row in rows:
+                date_str, count, amount = row
+                if date_str:
+                    try:
+                        # Parse DD.MM.YY format
+                        dt = datetime.strptime(date_str, "%d.%m.%y")
+                        month_key = dt.strftime("%m%Y")
+                        month_display = dt.strftime("%m/%Y")
+                        year = dt.strftime("%Y")
+                        years_present.add(year)
+                        
+                        if month_key not in month_data:
+                            month_data[month_key] = {"month": month_display, "count": 0, "amount": 0.0}
+                        
+                        month_data[month_key]["count"] += count or 0
+                        month_data[month_key]["amount"] += float(amount) if amount else 0.0
+                    except ValueError:
+                        logger.warning(f"Could not parse date: {date_str}")
+            
+            # Fill in all 12 months for each year present
+            if years_present:
+                for year in sorted(years_present):
+                    for month_num in range(1, 13):
+                        month_key = f"{month_num:02d}{year}"
+                        if month_key not in month_data:
+                            month_display = f"{month_num:02d}/{year}"
+                            month_data[month_key] = {"month": month_display, "count": 0, "amount": 0.0}
+            
+            # Convert to sorted list
+            data = sorted(month_data.values(), key=lambda x: x["month"])
+            for item in data:
+                item["invoice_count"] = item.pop("count")
+                item["total_amount"] = item.pop("amount")
+            
+            return {
+                "status": "ok",
+                "data": data
+            }
+    except Exception as e:
+        logger.error(f"SGB V data error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/verhinderungspflege")
+def get_verhinderungspflege_data():
+    """Get VerhinderungsPflege (care_account 4050) care record data grouped by month."""
+    try:
+        from app.db.connection import get_db
+        from datetime import datetime
+        
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT 
+                    cr.care_period_begin,
+                    COUNT(DISTINCT cr.id) as record_count,
+                    SUM(CAST(REPLACE(COALESCE(cs.total_price, '0'), ',', '.') AS REAL)) as total_amount
+                FROM care_records cr
+                LEFT JOIN care_services cs ON cr.id = cs.care_record_id
+                WHERE cr.pflegekonto = '4050'
+                GROUP BY cr.care_period_begin
+                ORDER BY cr.care_period_begin ASC
+            """)
+            rows = c.fetchall()
+            
+            # Build result data, parsing DD.MM.YY format and grouping by month
+            month_data = {}
+            years_present = set()
+            
+            for row in rows:
+                date_str, count, amount = row
+                if date_str:
+                    try:
+                        # Parse DD.MM.YY format
+                        dt = datetime.strptime(date_str, "%d.%m.%y")
+                        month_key = dt.strftime("%m%Y")
+                        month_display = dt.strftime("%m/%Y")
+                        year = dt.strftime("%Y")
+                        years_present.add(year)
+                        
+                        if month_key not in month_data:
+                            month_data[month_key] = {"month": month_display, "count": 0, "amount": 0.0}
+                        
+                        month_data[month_key]["count"] += count or 0
+                        month_data[month_key]["amount"] += float(amount) if amount else 0.0
+                    except ValueError:
+                        logger.warning(f"Could not parse date: {date_str}")
+            
+            # Fill in all 12 months for each year present
+            if years_present:
+                for year in sorted(years_present):
+                    for month_num in range(1, 13):
+                        month_key = f"{month_num:02d}{year}"
+                        if month_key not in month_data:
+                            month_display = f"{month_num:02d}/{year}"
+                            month_data[month_key] = {"month": month_display, "count": 0, "amount": 0.0}
+            
+            # Convert to sorted list
+            data = sorted(month_data.values(), key=lambda x: x["month"])
+            for item in data:
+                item["invoice_count"] = item.pop("count")
+                item["total_amount"] = item.pop("amount")
+            
+            return {
+                "status": "ok",
+                "data": data
+            }
+    except Exception as e:
+        logger.error(f"VerhinderungsPflege data error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
         
         return {
             "status": "ok",
             "message": "Patients and histogram data retrieved"
         }
+
+
+@app.get("/analytics/sgbv/patient/{patient_id}")
+def get_sgbv_by_patient(patient_id: int):
+    """Get SGB V care records for a specific patient grouped by month."""
+    try:
+        from app.db.connection import get_db
+        from datetime import datetime
+        
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT 
+                    cr.care_period_begin,
+                    COUNT(DISTINCT cr.id) as record_count,
+                    SUM(CAST(REPLACE(COALESCE(cs.total_price, '0'), ',', '.') AS REAL)) as total_amount
+                FROM care_records cr
+                LEFT JOIN care_services cs ON cr.id = cs.care_record_id
+                WHERE cr.pflegekonto = '4092' AND cr.patient_id = ?
+                GROUP BY cr.care_period_begin
+                ORDER BY cr.care_period_begin ASC
+            """, (patient_id,))
+            rows = c.fetchall()
+            
+            # Build result data, parsing DD.MM.YY format and grouping by month
+            month_data = {}
+            years_present = set()
+            
+            for row in rows:
+                date_str, count, amount = row
+                if date_str:
+                    try:
+                        # Parse DD.MM.YY format
+                        dt = datetime.strptime(date_str, "%d.%m.%y")
+                        month_key = dt.strftime("%m%Y")
+                        month_display = dt.strftime("%m/%Y")
+                        year = dt.strftime("%Y")
+                        years_present.add(year)
+                        
+                        if month_key not in month_data:
+                            month_data[month_key] = {"month": month_display, "count": 0, "amount": 0.0}
+                        
+                        month_data[month_key]["count"] += count or 0
+                        month_data[month_key]["amount"] += float(amount) if amount else 0.0
+                    except ValueError:
+                        logger.warning(f"Could not parse date: {date_str}")
+            
+            # Fill in all 12 months for each year present
+            if years_present:
+                for year in sorted(years_present):
+                    for month_num in range(1, 13):
+                        month_key = f"{month_num:02d}{year}"
+                        if month_key not in month_data:
+                            month_display = f"{month_num:02d}/{year}"
+                            month_data[month_key] = {"month": month_display, "count": 0, "amount": 0.0}
+            
+            # Convert to sorted list
+            data = sorted(month_data.values(), key=lambda x: x["month"])
+            for item in data:
+                item["invoice_count"] = item.pop("count")
+                item["total_amount"] = item.pop("amount")
+            
+            return {
+                "status": "ok",
+                "data": data
+            }
+    except Exception as e:
+        logger.error(f"SGB V patient data error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/verhinderungspflege/patient/{patient_id}")
+def get_verhinderungspflege_by_patient(patient_id: int):
+    """Get Verhinderungspflege care records for a specific patient grouped by month."""
+    try:
+        from app.db.connection import get_db
+        from datetime import datetime
+        
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT 
+                    cr.care_period_begin,
+                    COUNT(DISTINCT cr.id) as record_count,
+                    SUM(CAST(REPLACE(COALESCE(cs.total_price, '0'), ',', '.') AS REAL)) as total_amount
+                FROM care_records cr
+                LEFT JOIN care_services cs ON cr.id = cs.care_record_id
+                WHERE cr.pflegekonto = '4050' AND cr.patient_id = ?
+                GROUP BY cr.care_period_begin
+                ORDER BY cr.care_period_begin ASC
+            """, (patient_id,))
+            rows = c.fetchall()
+            
+            # Build result data, parsing DD.MM.YY format and grouping by month
+            month_data = {}
+            years_present = set()
+            
+            for row in rows:
+                date_str, count, amount = row
+                if date_str:
+                    try:
+                        # Parse DD.MM.YY format
+                        dt = datetime.strptime(date_str, "%d.%m.%y")
+                        month_key = dt.strftime("%m%Y")
+                        month_display = dt.strftime("%m/%Y")
+                        year = dt.strftime("%Y")
+                        years_present.add(year)
+                        
+                        if month_key not in month_data:
+                            month_data[month_key] = {"month": month_display, "count": 0, "amount": 0.0}
+                        
+                        month_data[month_key]["count"] += count or 0
+                        month_data[month_key]["amount"] += float(amount) if amount else 0.0
+                    except ValueError:
+                        logger.warning(f"Could not parse date: {date_str}")
+            
+            # Fill in all 12 months for each year present
+            if years_present:
+                for year in sorted(years_present):
+                    for month_num in range(1, 13):
+                        month_key = f"{month_num:02d}{year}"
+                        if month_key not in month_data:
+                            month_display = f"{month_num:02d}/{year}"
+                            month_data[month_key] = {"month": month_display, "count": 0, "amount": 0.0}
+            
+            # Convert to sorted list
+            data = sorted(month_data.values(), key=lambda x: x["month"])
+            for item in data:
+                item["invoice_count"] = item.pop("count")
+                item["total_amount"] = item.pop("amount")
+            
+            return {
+                "status": "ok",
+                "data": data
+            }
+    except Exception as e:
+        logger.error(f"Verhinderungspflege patient data error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ------------------------------

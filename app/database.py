@@ -5,6 +5,7 @@ from app.db.connection import get_db, DB_PATH
 from app.utils.parsing import GermanDecimalParser
 
 from app.db.repositories import InvoiceRepository, PatientRepository, ServiceRepository, CareRecordRepository, BillingSummaryRepository
+from app.utils.data_validation import DataNormalizer, DataValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -147,9 +148,20 @@ def insert_structured_data(data, origin_chunk_id: str | None = None):
         if "care_account" not in invoice:
             invoice["care_account"] = patient.get("pflege_konto", "")
 
-        invoice["summe_covered"] = f"{GermanDecimalParser.parse(invoice['summe_covered']):.2f}"
-        invoice["summe_total"] = f"{GermanDecimalParser.parse(invoice['summe_total']):.2f}"
-        invoice["amount_owed"] = f"{GermanDecimalParser.parse(invoice['summe_total']) - GermanDecimalParser.parse(invoice['summe_covered']):.2f}"
+        # Normalize birthdate to DD.MM.YYYY format with 4-digit year
+        try:
+            patient["birthdate"] = DataNormalizer.normalize_birthdate(patient.get("birthdate", ""))
+        except DataValidationError as e:
+            logger.error(f"Failed to normalize birthdate for patient {patient.get('name', '[unknown]')}: {e}")
+            return
+
+        # Normalize invoice amounts to standard format (period as decimal)
+        try:
+            invoice["summe_covered"] = DataNormalizer.normalize_amount(invoice.get("summe_covered", "0"))
+            invoice["summe_total"] = DataNormalizer.normalize_amount(invoice.get("summe_total", "0"))
+        except DataValidationError as e:
+            logger.error(f"Failed to normalize invoice amounts for patient {patient.get('name', '[unknown]')}: {e}")
+            return
 
         try:
             total_val = float(invoice["summe_total"])
@@ -159,12 +171,18 @@ def insert_structured_data(data, origin_chunk_id: str | None = None):
             return
 
         amount_owed = total_val - covered_val
-        invoice["amount_owed"] = f"{amount_owed:,.2f}".replace('.', ',').replace(',', '.', 1)
+        invoice["amount_owed"] = f"{amount_owed:.2f}"
 
+        # Normalize service amounts
         for s in services:
-            s["quantity"] = s["quantity"].replace(',', '.')
-            s["unit_price"] = GermanDecimalParser.parse(s["unit_price"])
-            s["total_price"] = GermanDecimalParser.parse(s["total_price"])
+            try:
+                s["unit_price"] = DataNormalizer.normalize_amount(s.get("unit_price", "0"))
+                s["total_price"] = DataNormalizer.normalize_amount(s.get("total_price", "0"))
+                # Normalize quantity (handle comma as decimal separator)
+                quantity_str = str(s.get("quantity", "0")).strip()
+                s["quantity"] = quantity_str.replace(',', '.')
+            except DataValidationError as e:
+                logger.warning(f"Failed to normalize service amount: {e}")
 
         c.execute("""
             INSERT OR IGNORE INTO patients (name, birthdate, insurance_number, care_level, include_service_packet)
@@ -249,6 +267,27 @@ def insert_care_record(data: dict, record_type: str, pflegekonto: str, origin_ch
         patient = data.get("patient", {})
         invoice = data.get("invoice", {})
         services = data.get("services", [])
+        
+        # Normalize birthdate to DD.MM.YYYY format with 4-digit year
+        try:
+            patient["birthdate"] = DataNormalizer.normalize_birthdate(patient.get("birthdate", ""))
+        except DataValidationError as e:
+            logger.error(f"Failed to normalize birthdate for care record patient {patient.get('name', '[unknown]')}: {e}")
+            return None
+        
+        # Normalize service amounts
+        for service in services:
+            try:
+                if service.get("unit_price"):
+                    service["unit_price"] = DataNormalizer.normalize_amount(service["unit_price"])
+                if service.get("total_price"):
+                    service["total_price"] = DataNormalizer.normalize_amount(service["total_price"])
+                # Normalize quantity (handle comma as decimal separator)
+                if service.get("quantity"):
+                    quantity_str = str(service.get("quantity", "0")).strip()
+                    service["quantity"] = quantity_str.replace(',', '.')
+            except DataValidationError as e:
+                logger.warning(f"Failed to normalize service amount in care record: {e}")
         
         # Ensure patient exists
         c.execute("""

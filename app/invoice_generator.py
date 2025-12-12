@@ -28,7 +28,28 @@ def split_address(address):
             return " ".join(parts[:i]), " ".join(parts[i:])
     return address, ""
 
+def format_german_number(value):
+    """Format a number in German locale: 1234.56 -> 1.234,56"""
+    if value is None or value == "":
+        return "0,00"
+    
+    try:
+        # Convert to float if string
+        if isinstance(value, str):
+            num = float(value.replace(",", "."))
+        else:
+            num = float(value)
+        
+        # Format with 2 decimal places
+        formatted = f"{num:,.2f}"
+        # Replace periods with a placeholder to avoid confusion
+        formatted = formatted.replace(",", "#").replace(".", ",").replace("#", ".")
+        return formatted
+    except (ValueError, TypeError):
+        return str(value)
+
 env.filters['split_address'] = split_address
+env.filters['german_number'] = format_german_number
 
 def parse_price(value):
     """Convert string prices like '32,00 EUR' to float."""

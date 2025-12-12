@@ -112,9 +112,8 @@
     <p>Pflegegrad: <strong>{{ patient.care_level }}</strong> Ambulant</p>
   </div>
 
-  {% set covered = invoice.sum_covered | replace('.', '') | replace(',', '.') | float %}
-  {% set amount_owed = invoice.amount_owed | replace('.', '') | replace(',', '.') | float %}
-  {% set final_total_str = ("%0.2f"|format(amount_owed)).replace('.', ',') %}
+  {% set covered = invoice.sum_covered | float %}
+  {% set amount_owed = invoice.amount_owed | float %}
 
   <br><br><br>
   <table>
@@ -133,15 +132,15 @@
         <td>{{ item.code }}</td>
         <td>{{ item.description }}</td>
         <td>{{ item.quantity }}</td>
-        <td>{% if item.unit_price %}{{ item.unit_price }} EUR{% endif %}</td>
-        <td>{% if item.total_price %}{{ item.total_price }} EUR{% endif %}</td>
+        <td>{% if item.unit_price %}{{ item.unit_price | german_number }} EUR{% endif %}</td>
+        <td>{% if item.total_price %}{{ item.total_price | german_number }} EUR{% endif %}</td>
       </tr>
       {% endfor %}
       <tr>
         <td></td>
         <td>Abzug Pflegegrad</td>
         <td></td>
-        <td>-{{ "%.2f"|format(covered) | replace('.', ',') }} EUR</td>
+        <td>-{{ covered | german_number }} EUR</td>
         <td></td>
       </tr>
     </tbody>
@@ -150,7 +149,7 @@
   <br><br>
   <table class="totals">
     <tr>
-      <td class="invoice-total" colspan="5">Rechnungsbetrag: {{ final_total_str }} EUR</td>
+      <td class="invoice-total" colspan="5">Rechnungsbetrag: {{ amount_owed | german_number }} EUR</td>
     </tr>
   </table>
   <br>

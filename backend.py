@@ -860,6 +860,72 @@ def get_verhinderungspflege_data():
         }
 
 
+@app.get("/analytics/sgbxi")
+def get_sgbxi_data():
+    """Get SGB XI & Entlastungsleistungen data grouped by care_range_begin month."""
+    try:
+        from app.db.connection import get_db
+        from datetime import datetime
+        
+        with get_db() as conn:
+            c = conn.cursor()
+            # Query invoices for SGB XI accounts (4064, 4062, 4010, 4020, 4040, 4030)
+            c.execute("""
+                SELECT 
+                    care_range_begin,
+                    COUNT(*) as invoice_count,
+                    SUM(CAST(REPLACE(COALESCE(sum_total, '0'), ',', '.') AS REAL)) as total_amount
+                FROM invoices
+                WHERE care_account IN ('4010', '4020', '4030', '4040', '4062', '4064')
+                GROUP BY care_range_begin
+                ORDER BY care_range_begin ASC
+            """)
+            rows = c.fetchall()
+            
+            # Build result data, parsing DD.MM.YY format and grouping by month
+            month_data = {}
+            years_present = set()
+            
+            for row in rows:
+                date_str, count, amount = row
+                if date_str:
+                    try:
+                        # Parse DD.MM.YY format
+                        dt = datetime.strptime(date_str, "%d.%m.%y")
+                        month_key = dt.strftime("%m%Y")
+                        month_display = dt.strftime("%m/%Y")
+                        year = dt.strftime("%Y")
+                        years_present.add(year)
+                        
+                        if month_key not in month_data:
+                            month_data[month_key] = {"month": month_display, "invoice_count": 0, "total_amount": 0.0}
+                        
+                        month_data[month_key]["invoice_count"] += count or 0
+                        month_data[month_key]["total_amount"] += float(amount) if amount else 0.0
+                    except ValueError:
+                        logger.warning(f"Could not parse date: {date_str}")
+            
+            # Fill in all 12 months for each year present
+            if years_present:
+                for year in sorted(years_present):
+                    for month_num in range(1, 13):
+                        month_key = f"{month_num:02d}{year}"
+                        if month_key not in month_data:
+                            month_display = f"{month_num:02d}/{year}"
+                            month_data[month_key] = {"month": month_display, "invoice_count": 0, "total_amount": 0.0}
+            
+            # Convert to sorted list
+            data = sorted(month_data.values(), key=lambda x: x["month"])
+            
+            return {
+                "status": "ok",
+                "data": data
+            }
+    except Exception as e:
+        logger.error(f"SGB XI data error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/analytics/sgbv/patient/{patient_id}")
 def get_sgbv_by_patient(patient_id: int):
     """Get SGB V care records for a specific patient grouped by month."""

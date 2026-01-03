@@ -253,7 +253,7 @@ def build_prompt(attempt=0):
     return base_prompt
 
 def extract_structured_data_with_openai(chunk_text, retries=2):
-  MODEL = "gpt-5-mini-2025-08-07"
+  MODEL = "gpt-4o-mini"
   # Assumed model token limit for planning. If you know the exact limit for the model,
   # you can control limits via ParsingConfig.get_max_tokens_per_call() in pdf parsing.
 
@@ -315,7 +315,7 @@ def extract_batch_structured_data(chunk_texts: list, retries=2):
   Returns:
     List of structured data objects, one per chunk. Failed chunks return None.
   """
-  MODEL = "gpt-5-mini-2025-08-07"
+  MODEL = "gpt-4o-mini"
   
   if not chunk_texts:
     return []
@@ -574,7 +574,7 @@ def generate_sql_from_question(question: str) -> dict:
     - optionally "chart" metadata
     """
     response = client.chat.completions.create(
-        model="gpt-5-mini-2025-08-07",
+        model="gpt-4o-mini",
         messages=[{"role": "system", "content": SYSTEM_PROMPT},
                   {"role": "user", "content": prompt}],
         response_format={"type": "json_object"}  
@@ -637,7 +637,7 @@ def generate_visualization(question: str, mode="auto"):
     """
 
     rsp = client.chat.completions.create(
-        model="gpt-5-2025-08-07",
+        model="gpt-4o-mini",
         messages=[{"role": "system", "content": vis_prompt}],
         response_format={"type": "json_object"}
     )

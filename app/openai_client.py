@@ -113,8 +113,21 @@ def build_prompt(attempt=0):
       1. Patient details
       2. A list of ALL services in the block (each with quantity, code, description, unit price, total)
       3. Invoice object to be copied as it is.
-      5. Note: All monetary values must be formatted in German style, using ',' for decimals and '.' for thousands (e.g. "1.234,56").
+      4. Note: All monetary values must be formatted in German style, using ',' for decimals and '.' for thousands (e.g. "1.234,56").
          That means: unit price, total, summe_covered, summe_total
+      
+      CRITICAL: After the "Summe €" label, extract the FIRST monetary value as summe_covered and the SECOND as summe_total.
+      These may appear on the same line or on the next lines. For example:
+      
+      If on next lines:
+        Summe €
+        1.068,57
+        1.068,57
+      Then: summe_covered = 1.068,57, summe_total = 1.068,57
+      
+      If on same line:
+        Summe €    1.068,57    1.068,57
+      Then: summe_covered = 1.068,57, summe_total = 1.068,57
       
       Types of Sample block:
       Verordnung: 01.03.25 
@@ -253,7 +266,7 @@ def build_prompt(attempt=0):
     return base_prompt
 
 def extract_structured_data_with_openai(chunk_text, retries=2):
-  MODEL = "gpt-4o-mini"
+  MODEL = "gpt-5-mini"
   # Assumed model token limit for planning. If you know the exact limit for the model,
   # you can control limits via ParsingConfig.get_max_tokens_per_call() in pdf parsing.
 
@@ -266,6 +279,13 @@ def extract_structured_data_with_openai(chunk_text, retries=2):
       logger.debug(f"Token estimate for request: {token_count} tokens (model={MODEL})")
     except Exception:
       token_count = None
+
+    # Debug log: Check if chunk has SGBV and amounts
+    if "pflegekonto: 4092" in chunk_text.lower():
+      logger.info("=" * 80)
+      logger.info("[SGBV OpenAI] Received chunk with SGBV")
+      logger.info(f"[SGBV OpenAI] Chunk (first 1000 chars):\n{chunk_text[:1000]}")
+      logger.info("=" * 80)
 
     try:
       rsp = client.chat.completions.create(
@@ -287,6 +307,17 @@ def extract_structured_data_with_openai(chunk_text, retries=2):
 
       content = rsp.choices[0].message.content
       parsed = json.loads(content)
+      
+      # Debug log for SGBV - log full response
+      care_account = parsed.get("invoice", {}).get("care_account", "")
+      if care_account == "4092" or "4092" in str(parsed):
+          logger.info("=" * 80)
+          logger.info("[SGBV OpenAI Response]")
+          logger.info(f"[SGBV Response] Full parsed JSON:\n{json.dumps(parsed, indent=2, ensure_ascii=False)}")
+          logger.info(f"[SGBV Response] summe_covered: {parsed['invoice'].get('summe_covered')}")
+          logger.info(f"[SGBV Response] summe_total: {parsed['invoice'].get('summe_total')}")
+          logger.info("=" * 80)
+      
       return parsed
 
     except Exception as e:
@@ -315,7 +346,7 @@ def extract_batch_structured_data(chunk_texts: list, retries=2):
   Returns:
     List of structured data objects, one per chunk. Failed chunks return None.
   """
-  MODEL = "gpt-4o-mini"
+  MODEL = "gpt-5-mini"
   
   if not chunk_texts:
     return []
@@ -382,6 +413,11 @@ Process all chunks sequentially in the same request.
 
       content = rsp.choices[0].message.content
       parsed = json.loads(content)
+      
+      # Debug logging for batch results
+      print(f"\n[BATCH RESPONSE] Raw content (first 1000 chars):\n{content[:1000]}")
+      if any("4092" in ct for ct in chunk_texts):
+        print(f"[BATCH RESPONSE] Has SGBV chunks. Full parsed:\n{parsed}")
 
       # Ensure we always return a list
       if isinstance(parsed, dict) and "invoices" in parsed:
@@ -574,7 +610,7 @@ def generate_sql_from_question(question: str) -> dict:
     - optionally "chart" metadata
     """
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5-mini",
         messages=[{"role": "system", "content": SYSTEM_PROMPT},
                   {"role": "user", "content": prompt}],
         response_format={"type": "json_object"}  
@@ -637,7 +673,7 @@ def generate_visualization(question: str, mode="auto"):
     """
 
     rsp = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5-mini",
         messages=[{"role": "system", "content": vis_prompt}],
         response_format={"type": "json_object"}
     )

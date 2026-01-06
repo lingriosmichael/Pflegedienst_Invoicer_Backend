@@ -111,3 +111,9 @@ class GermanDecimalParser:
         """
         float_val = GermanDecimalParser.parse(val)
         return f"{float_val:.{decimal_places}f}"
+
+
+def generate_id(prefix: str) -> str:
+    """Generate unique ID with prefix for new unified schema."""
+    import uuid
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"

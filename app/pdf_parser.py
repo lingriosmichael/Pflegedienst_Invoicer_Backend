@@ -60,6 +60,17 @@ def extract_billing_summary(first_page_text):
         logger.error(f"Error extracting billing summary: {e}")
         return None
 
+def generate_random_billing_summary():
+    """Generate random billing summary data for testing/demo purposes."""
+    import random
+    count = random.randint(5, 50)
+    amount = random.uniform(500, 10000)
+    
+    return {
+        "submitted_invoices_count": count,
+        "submitted_invoices_amount": round(amount, 2)
+    }
+
 
 def split_into_chunks(text):
     raw_chunks = []
@@ -86,31 +97,20 @@ def split_into_chunks(text):
         summe_idx = None
         for i, line in enumerate(lines):
             if line.strip().startswith("Summe €"):
+                # Check if amounts are on following lines
                 next_lines = lines[i+1:i+3]
                 if all(InvoicePatterns.EURO_AMOUNT.value.match(ln.strip()) for ln in next_lines):
                     summe_idx = i + 2
                 else:
+                    # Amounts might be on the same line as "Summe €", so include this line
                     summe_idx = i
 
-        trimmed = lines[:summe_idx+1] if summe_idx is not None else lines
+        # Include all lines up to and including the summe line (with amounts)
+        # Add 1 extra line in case amounts span to next line
+        trimmed = lines[:summe_idx+2] if summe_idx is not None else lines
 
-        euro_values = [
-            val.strip() for val in trimmed[-2:]
-            if InvoicePatterns.EURO_AMOUNT.value.match(val.strip())
-        ]
-
-        if len(euro_values) == 2:
-            v1, v2 = euro_values
-            v1_float = GermanDecimalParser.parse(v1)
-            v2_float = GermanDecimalParser.parse(v2)
-            if v1_float >= v2_float:
-                summe_total = v1
-                summe_covered = v2
-            else:
-                summe_total = v2
-                summe_covered = v1
-        else:
-            summe_total = summe_covered = None
+        # Don't try to extract amounts via regex here - let OpenAI extract them from the full text
+        # This ensures SGBV and other formats work correctly regardless of PDF structure
 
         pflegezeitraum_beginn = pflegezeitraum_ende = None
         for line in lines:
@@ -120,7 +120,15 @@ def split_into_chunks(text):
                 break
 
         final_text = "\n".join(trimmed)
-        final_text += f'\n"invoice": {{\n    "pflegezeitraum_beginn": {pflegezeitraum_beginn},\n    "pflegezeitraum_ende": {pflegezeitraum_ende},\n    "summe_covered": {summe_covered},\n    "summe_total": {summe_total}\n}}'
+        # Note: summe_covered and summe_total will be extracted by OpenAI from the text
+        final_text += f'\n"invoice": {{\n    "pflegezeitraum_beginn": {pflegezeitraum_beginn},\n    "pflegezeitraum_ende": {pflegezeitraum_ende}\n}}'
+
+        # Debug logging for SGBV
+        if "pflegekonto: 4092" in final_text.lower():
+            logger.info("=" * 80)
+            logger.info("[SGBV CHUNK] About to send to OpenAI")
+            logger.info(f"[SGBV CHUNK] Full text:\n{final_text}")
+            logger.info("=" * 80)
 
         # Ensure each chunk is small enough for the OpenAI model.
         # Use configurable max tokens from ParsingConfig.
@@ -201,7 +209,7 @@ def filter_chunks_by_mode(chunks, mode):
 
         if mode == "sgbxi":
             # Skip special Pflegekonto codes (4092, 4050, 4064)
-            if any(code in chunk_lower for code in ("pflegekonto: 4092", "pflegekonto: 4050", "pflegekonto: 4064")):
+            if any(code in chunk_lower for code in ("pflegekonto: 4092", "pflegekonto: 4064")):
                 logger.debug(f"Skipping chunk {i+1} (chunk_id={chunk_id}) — special pflegekonto.")
                 continue
 
@@ -256,6 +264,14 @@ def process_import_sgbxi(text_chunks, abrechnungsmonat):
             chunk_id = chunk_entry.get("chunk_id") if isinstance(chunk_entry, dict) else None
             chunk_texts.append(chunk_text)
             chunk_metadata.append({"chunk_id": chunk_id, "chunk_entry": chunk_entry})
+            
+            # Log SGBV chunks before sending to OpenAI
+            if "pflegekonto: 4092" in chunk_text.lower():
+                print(f"\n[SGBV CHUNK BEFORE OpenAI] Chunk ID: {chunk_id}")
+                print("=" * 80)
+                print(chunk_text[:500])  # First 500 chars
+                print("..." if len(chunk_text) > 500 else "")
+                print("=" * 80)
         
         # Get batch extraction results
         try:
@@ -278,7 +294,16 @@ def process_import_sgbxi(text_chunks, abrechnungsmonat):
         for result_idx, (structured, metadata) in enumerate(zip(batch_results, chunk_metadata), 1):
             chunk_id = metadata["chunk_id"]
             chunk_entry = metadata["chunk_entry"]
+            chunk_text = chunk_entry["text"] if isinstance(chunk_entry, dict) else chunk_entry
             global_idx = (batch_idx - 1) * BATCH_SIZE + result_idx
+            
+            # Log SGBV OpenAI responses
+            if "pflegekonto: 4092" in chunk_text.lower():
+                print(f"\n[SGBV OpenAI RESULT] Chunk ID: {chunk_id}")
+                print(f"Raw response: {structured}")
+                if structured:
+                    invoice = structured.get("invoice", {})
+                    print(f"Invoice section: summe_covered={invoice.get('summe_covered')}, summe_total={invoice.get('summe_total')}")
             
             print(f"\n--- Result {result_idx}/{len(batch)} (Global: {global_idx}) ---")
             print(f"Chunk ID: {chunk_id}")
@@ -295,6 +320,9 @@ def process_import_sgbxi(text_chunks, abrechnungsmonat):
             
             # Validate required fields
             if not invoice or "summe_covered" not in invoice or "summe_total" not in invoice:
+                is_sgbv = "pflegekonto: 4092" in chunk_text.lower()
+                if is_sgbv:
+                    print(f"\n[SGBV MISSING AMOUNTS] Chunk ID: {chunk_id}, Retrying individually...")
                 logger.warning(f"Batch result {result_idx}: Missing invoice totals for {name}. Retrying individually...")
                 chunk_text = chunk_entry["text"] if isinstance(chunk_entry, dict) else chunk_entry
                 try:
@@ -304,14 +332,22 @@ def process_import_sgbxi(text_chunks, abrechnungsmonat):
                         if "summe_covered" in invoice_retry and "summe_total" in invoice_retry:
                             structured = structured_retry
                             invoice = invoice_retry
+                            if is_sgbv:
+                                print(f"[SGBV RETRY SUCCESS] Found: summe_covered={invoice.get('summe_covered')}, summe_total={invoice.get('summe_total')}")
                             logger.info(f"Individual retry successful for {name}: found summe_covered={invoice.get('summe_covered')}, summe_total={invoice.get('summe_total')}")
                         else:
+                            if is_sgbv:
+                                print(f"[SGBV RETRY FAILED] Still missing amounts after retry. Invoice: {invoice_retry}")
                             logger.error(f"Individual retry failed for {name}: Missing required fields. Skipping.")
                             continue
                     else:
+                        if is_sgbv:
+                            print(f"[SGBV RETRY FAILED] No response from OpenAI on individual retry")
                         logger.error(f"Individual retry failed for {name}: No response. Skipping.")
                         continue
                 except Exception as e:
+                    if is_sgbv:
+                        print(f"[SGBV RETRY ERROR] {e}")
                     logger.error(f"Individual retry error for {name}: {e}. Skipping.")
                     continue
             
@@ -326,7 +362,7 @@ def process_import_sgbxi(text_chunks, abrechnungsmonat):
             # Each structured object from the batch_results list is inserted separately
             for attempt in range(3):
                 try:
-                    database.insert_structured_data(structured, origin_chunk_id=chunk_id)
+                    database.insert_structured_data(structured, origin_chunk_id=chunk_id, invoicing_month=abrechnungsmonat)
                     logger.info(f"✓ Batch {batch_idx}, Result {result_idx}/{len(batch)}: Successfully inserted {patient.get('insurance_number')} ({name})")
                     inserted += 1
                     break

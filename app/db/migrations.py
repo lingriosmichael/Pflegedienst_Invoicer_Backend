@@ -74,3 +74,47 @@ def migrate_care_records_to_services_table():
         conn.commit()
         if migrated_count > 0:
             logger.info(f"✓ Migrated {migrated_count} care_records to care_services table")
+
+def migrate_verhinderungspflege_event_types():
+    """
+    Fix existing Verhinderungspflege records that were incorrectly stored as event_type='SGBV'.
+    Updates all records with care_account=4050 to have event_type='Verhinderungspflege'.
+    This migration is idempotent and safe to run multiple times.
+    """
+    with get_db() as conn:
+        c = conn.cursor()
+        
+        try:
+            # Check if care_events table exists and has the necessary columns
+            c.execute("PRAGMA table_info(care_events)")
+            columns = {row[1] for row in c.fetchall()}
+            
+            if 'event_type' not in columns or 'care_account' not in columns:
+                logger.info("care_events table missing expected columns - migration skipped")
+                return
+            
+            # Count records to migrate
+            c.execute("""
+                SELECT COUNT(*) FROM care_events 
+                WHERE care_account = '4050' AND event_type = 'SGBV'
+            """)
+            count_to_migrate = c.fetchone()[0]
+            
+            if count_to_migrate == 0:
+                logger.info("✓ No Verhinderungspflege records need migration (all already correct)")
+                return
+            
+            # Migrate: Update event_type from SGBV to Verhinderungspflege for all 4050 records
+            c.execute("""
+                UPDATE care_events 
+                SET event_type = 'Verhinderungspflege'
+                WHERE care_account = '4050' AND event_type = 'SGBV'
+            """)
+            
+            conn.commit()
+            logger.info(f"✓ Fixed {count_to_migrate} Verhinderungspflege records (event_type: SGBV → Verhinderungspflege)")
+            
+        except Exception as e:
+            logger.error(f"Migration failed: {e}")
+            conn.rollback()
+            raise

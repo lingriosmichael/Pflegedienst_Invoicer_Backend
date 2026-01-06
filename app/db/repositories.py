@@ -370,23 +370,41 @@ class BillingSummaryRepository:
     
     @staticmethod
     def insert(abrechnungsmonat: str, submitted_invoices_count: int, submitted_invoices_amount: float, created_at: str = None):
-        """Insert a billing summary record if it doesn't already exist."""
+        """Insert or aggregate billing summary. Accumulates counts/amounts for the same month across multiple PDFs."""
         if created_at is None:
             created_at = datetime.now().isoformat()
         
         with get_db() as conn:
             c = conn.cursor()
             # Check if month already exists
-            c.execute("SELECT id FROM billing_summary WHERE abrechnungsmonat = ?", (abrechnungsmonat,))
-            if c.fetchone():
-                return None  # Already exists, skip insert
+            c.execute(
+                "SELECT id, submitted_invoices_count, submitted_invoices_amount FROM billing_summary WHERE abrechnungsmonat = ?",
+                (abrechnungsmonat,)
+            )
+            existing = c.fetchone()
             
-            c.execute("""
-                INSERT INTO billing_summary (abrechnungsmonat, submitted_invoices_count, submitted_invoices_amount, created_at)
-                VALUES (?, ?, ?, ?)
-            """, (abrechnungsmonat, submitted_invoices_count, submitted_invoices_amount, created_at))
-            conn.commit()
-            return c.lastrowid
+            if existing:
+                # Update: AGGREGATE (add to existing counts and amounts)
+                existing_id, existing_count, existing_amount = existing
+                new_count = existing_count + submitted_invoices_count
+                new_amount = existing_amount + submitted_invoices_amount
+                
+                c.execute("""
+                    UPDATE billing_summary
+                    SET submitted_invoices_count = ?,
+                        submitted_invoices_amount = ?
+                    WHERE abrechnungsmonat = ?
+                """, (new_count, new_amount, abrechnungsmonat))
+                conn.commit()
+                return existing_id
+            else:
+                # Insert: FIRST PDF for this month
+                c.execute("""
+                    INSERT INTO billing_summary (abrechnungsmonat, submitted_invoices_count, submitted_invoices_amount, created_at)
+                    VALUES (?, ?, ?, ?)
+                """, (abrechnungsmonat, submitted_invoices_count, submitted_invoices_amount, created_at))
+                conn.commit()
+                return c.lastrowid
     
     @staticmethod
     def find_by_month(abrechnungsmonat: str):

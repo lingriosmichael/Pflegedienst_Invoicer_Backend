@@ -101,7 +101,12 @@ def group_services(services):
 
 def generate_invoice_pdf(data):    
     care_account = data["invoice"].get("care_account")
-    if care_account == "4064":
+    event_type = data["invoice"].get("event_type")
+    
+    # Select template based on event type
+    if event_type == "ServicePacket":
+        template_name = "invoice_template_service_packet.html"
+    elif event_type == "Entleistung":
         template_name = "invoice_template_4064.html"
     else:
         template_name = "invoice_template.html"
@@ -138,7 +143,14 @@ def generate_invoice_pdf(data):
 
 def process_generate_invoices(invoicing_month=None):
     from app.db.repositories import InvoiceRepository
+    from app.database import get_orphaned_service_packet_cases
+    
     cases = get_private_invoice_cases(invoicing_month)
+    
+    # After regular invoices, also generate invoices for orphaned service packets
+    if invoicing_month:
+        orphaned_cases = get_orphaned_service_packet_cases(invoicing_month)
+        cases.extend(orphaned_cases)
 
     for case in cases:
         try:
@@ -149,8 +161,9 @@ def process_generate_invoices(invoicing_month=None):
             if not current_number:
                 assigned_number = InvoiceRepository.get_next_invoice_number()
                 case["invoice"]["invoice_number"] = assigned_number
-                # Update in DB using repository
-                InvoiceRepository.update_invoice_number(invoice_id, assigned_number)
+                # Update in DB using repository (only if this is a real care event, not synthetic)
+                if not case["invoice"]["id"].startswith("service_packet_"):
+                    InvoiceRepository.update_invoice_number(invoice_id, assigned_number)
 
             path = generate_invoice_pdf(case)
             logger.info(f"PDF created: {path}")
@@ -158,4 +171,5 @@ def process_generate_invoices(invoicing_month=None):
         except Exception as e:
             invoice_number = case["invoice"].get("invoice_number", "[unknown]")
             logger.error(f"PDF failed for invoice {invoice_number}: {e}")
+
 

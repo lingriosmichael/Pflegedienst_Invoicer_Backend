@@ -241,7 +241,7 @@ def reimport_pdf(filename: str = Form(...), abrechnungsmonat: str = Form(...), i
 @app.post("/generate_invoices")
 def generate_invoices(req: InvoiceRequest):
     # First mark invoices ready based on amount_owed and service packet flag
-    database.mark_month_ready_for_generation(req.abrechnungsmonat)
+    database.mark_month_ready_for_generation(req.abrechnungsmonat, legacy_entleistung=True)
     # Then generate the invoices
     invoice_generator.process_generate_invoices(req.abrechnungsmonat)
     return {"status": "ok", "message": "Rechnungen erstellt"}
@@ -392,6 +392,12 @@ def process_pdf(req: ProcessRequest):
     else:
         raise ValueError(f"Unknown processing mode: {req.mode}")
 
+    # Auto-validate and fix any reversed sum_covered/sum_total in SGBXI records
+    if req.mode in ["sgbxi", "entleistung"]:
+        validation_result = database.validate_and_fix_sgbxi_amounts()
+        if validation_result['corrected_count'] > 0:
+            logger.info(f"Auto-corrected {validation_result['corrected_count']} SGBXI records with reversed amounts")
+
     return {
         "status": "processed",
         "mode": req.mode,
@@ -454,12 +460,54 @@ def mark_ready(req: MarkReadyRequest):
         if len(m) != 6 or not m.isdigit():
             raise HTTPException(status_code=400, detail="invoicing_month must be MMYYYY")
 
-        updated = database.mark_month_ready_for_generation(m, req.only_positive)
+        updated = database.mark_month_ready_for_generation(m, req.only_positive, legacy_entleistung=False)
         return {"status": "ok", "updated": updated}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"/mark_ready error:\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/mark_ready_legacy")
+def mark_ready_legacy(req: MarkReadyRequest):
+    """
+    Mark month ready for generation using LEGACY Entleistung logic.
+    Legacy logic: Anything > 125 EUR per month gets invoiced (simple monthly threshold).
+    Use this for December 2025 and earlier months before the yearly cumulative logic was implemented.
+    """
+    try:
+        m = (req.invoicing_month or "").strip()
+        if len(m) != 6 or not m.isdigit():
+            raise HTTPException(status_code=400, detail="invoicing_month must be MMYYYY")
+
+        updated = database.mark_month_ready_for_generation(m, req.only_positive, legacy_entleistung=True)
+        return {"status": "ok", "updated": updated}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/mark_ready_legacy error:\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/validate_sgbxi_amounts")
+async def validate_sgbxi_amounts():
+    """
+    Validate all SGBXI records and auto-correct any reversed sum_covered/sum_total.
+    
+    Rule: sum_covered must always be <= sum_total
+    If sum_covered > sum_total, they are automatically swapped.
+    
+    Returns: counts of corrections made and total records checked.
+    """
+    try:
+        result = database.validate_and_fix_sgbxi_amounts()
+        return {
+            "status": "success",
+            "corrected_count": result['corrected_count'],
+            "total_checked": result['total_checked'],
+            "message": f"Corrected {result['corrected_count']} out of {result['total_checked']} SGBXI records"
+        }
+    except Exception as e:
+        logger.error(f"/validate_sgbxi_amounts error:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.post("/ai/visualize")

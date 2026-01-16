@@ -87,12 +87,17 @@ class InvoiceRepository:
 
     @staticmethod
     def update_invoice_number(invoice_id: int, invoice_number: int):
-        """Atomically assign invoice number to an invoice."""
+        """Atomically assign invoice number to an invoice.
+        
+        In unified schema, invoice_id is actually the care_event_id.
+        Invoice numbers are stored in billing_details table.
+        """
         with get_db() as conn:
             c = conn.cursor()
-            c.execute("UPDATE invoices SET invoice_number = ? WHERE id = ?", (invoice_number, invoice_id))
+            # Update invoice number in billing_details where care_event_id matches
+            c.execute("UPDATE billing_details SET invoice_number = ? WHERE care_event_id = ?", (invoice_number, invoice_id))
             conn.commit()
-            logger.info(f"Assigned invoice number {invoice_number} to invoice {invoice_id}")
+            logger.info(f"Assigned invoice number {invoice_number} to care_event {invoice_id}")
 
     @staticmethod
     def count_by_month(month: str):

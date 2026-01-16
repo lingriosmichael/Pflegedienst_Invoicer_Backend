@@ -98,21 +98,35 @@ def insert_structured_data(data, origin_chunk_id: str | None = None, invoicing_m
         existing = c.fetchone()
         
         if existing:
-            # Patient exists - reuse their ID and update with new data (care_level, address)
+            # Patient exists - reuse their ID and update with new data
             patient_id = existing[0]
-            c.execute("""
-                UPDATE patient_profiles 
-                SET patient_name = ?, date_of_birth = ?, care_level = ?, 
-                    include_service_packet = ?, updated_at = ?
-                WHERE patient_id = ?
-            """, (
-                patient.get("name"),
-                patient.get("birthdate"),
-                patient.get("care_level"),
-                int(bool(patient.get("include_service_packet", 0))),
-                datetime.now().isoformat(),
-                patient_id
-            ))
+            
+            # Only update care_level if it exists in PDF data (don't overwrite with None/empty)
+            care_level_to_update = patient.get("care_level")
+            if care_level_to_update:
+                c.execute("""
+                    UPDATE patient_profiles 
+                    SET patient_name = ?, date_of_birth = ?, care_level = ?, updated_at = ?
+                    WHERE patient_id = ?
+                """, (
+                    patient.get("name"),
+                    patient.get("birthdate"),
+                    care_level_to_update,
+                    datetime.now().isoformat(),
+                    patient_id
+                ))
+            else:
+                # care_level not in PDF - update other fields only, preserve existing care_level
+                c.execute("""
+                    UPDATE patient_profiles 
+                    SET patient_name = ?, date_of_birth = ?, updated_at = ?
+                    WHERE patient_id = ?
+                """, (
+                    patient.get("name"),
+                    patient.get("birthdate"),
+                    datetime.now().isoformat(),
+                    patient_id
+                ))
         else:
             # New patient - generate new ID and insert
             patient_id = generate_id("pat")
@@ -256,17 +270,33 @@ def insert_care_record(data: dict, record_type: str, pflegekonto: str, origin_ch
         if existing:
             # Patient exists - reuse their ID and update with new data
             patient_id = existing[0]
-            c.execute("""
-                UPDATE patient_profiles 
-                SET patient_name = ?, date_of_birth = ?, care_level = ?, updated_at = ?
-                WHERE patient_id = ?
-            """, (
-                patient.get("name"),
-                patient.get("birthdate"),
-                patient.get("care_level"),
-                datetime.now().isoformat(),
-                patient_id
-            ))
+            
+            # Only update care_level if it exists in PDF data (don't overwrite with None/empty)
+            care_level_to_update = patient.get("care_level")
+            if care_level_to_update:
+                c.execute("""
+                    UPDATE patient_profiles 
+                    SET patient_name = ?, date_of_birth = ?, care_level = ?, updated_at = ?
+                    WHERE patient_id = ?
+                """, (
+                    patient.get("name"),
+                    patient.get("birthdate"),
+                    care_level_to_update,
+                    datetime.now().isoformat(),
+                    patient_id
+                ))
+            else:
+                # care_level not in PDF - update other fields only, preserve existing care_level
+                c.execute("""
+                    UPDATE patient_profiles 
+                    SET patient_name = ?, date_of_birth = ?, updated_at = ?
+                    WHERE patient_id = ?
+                """, (
+                    patient.get("name"),
+                    patient.get("birthdate"),
+                    datetime.now().isoformat(),
+                    patient_id
+                ))
         else:
             # New patient - generate new ID and insert
             from app.utils.parsing import generate_id
@@ -433,42 +463,54 @@ def get_private_invoice_cases(invoicing_month=None, invoice_id=None):
         if invoice_id:
             # Get specific care event (must be billable type)
             c.execute("""
-                SELECT ce.care_event_id, ce.patient_id, ce.invoicing_month, ce.invoice_number,
-                       ce.amount_owed, ce.sum_covered, ce.sum_total, ce.care_range_begin, ce.care_range_end
+                SELECT ce.care_event_id, ce.patient_id, ce.period_start_date, ce.period_end_date,
+                       bd.invoice_number, bd.amount_owed, bd.sum_covered, bd.sum_total, 
+                       ce.event_type, bd.invoicing_month
                 FROM care_events ce
                 JOIN billing_details bd ON ce.care_event_id = bd.care_event_id
                 WHERE ce.care_event_id = ? AND ce.event_type IN ('SGBXI', 'Entleistung')
             """, (invoice_id,))
             row = c.fetchone()
             if row:
-                care_event_id, patient_id, month, inv_num, amt_owed, sum_cov, sum_tot, range_begin, range_end = row
+                care_event_id, patient_id, care_start, care_end, inv_num, amt_owed, sum_cov, sum_tot, event_type, invoicing_month = row
                 
-                # Get patient
-                c.execute("SELECT patient_id, patient_name, insurance_number, birthdate, care_level FROM patient_profiles WHERE patient_id = ?", (patient_id,))
+                # Get patient (including include_service_packet flag, address, and debtor_id)
+                c.execute("SELECT patient_id, patient_name, insurance_number, date_of_birth, care_level, include_service_packet, street_name, street_number, postal_code, city, debtor_id FROM patient_profiles WHERE patient_id = ?", (patient_id,))
                 patient_row = c.fetchone()
                 
                 # Get services
-                c.execute("SELECT service_id, code, description, quantity, unit_price, total_price FROM care_services_new WHERE care_event_id = ?", (care_event_id,))
+                c.execute("SELECT service_id, service_code, service_description, quantity_value, unit_price, line_total FROM care_services_new WHERE care_event_id = ?", (care_event_id,))
                 services_rows = c.fetchall()
                 
                 if patient_row:
+                    # Construct address from split fields
+                    street_name = patient_row[6] or ""
+                    street_number = patient_row[7] or ""
+                    postal_code = patient_row[8] or ""
+                    city = patient_row[9] or ""
+                    address = f"{street_name} {street_number} {postal_code} {city}".strip()
+                    
                     case = {
                         "invoice": {
                             "id": care_event_id,
-                            "invoicing_month": month,
+                            "invoicing_month": invoicing_month,
                             "invoice_number": inv_num,
                             "amount_owed": amt_owed,
                             "sum_covered": sum_cov,
                             "sum_total": sum_tot,
-                            "care_range_begin": range_begin,
-                            "care_range_end": range_end
+                            "care_range_begin": care_start,
+                            "care_range_end": care_end,
+                            "event_type": event_type
                         },
                         "patient": {
                             "id": patient_row[0],
                             "name": patient_row[1],
                             "insurance_number": patient_row[2],
-                            "birthdate": patient_row[3],
-                            "care_level": patient_row[4]
+                            "birthdate": patient_row[3],  # date_of_birth from DB
+                            "care_level": patient_row[4],
+                            "include_service_packet": patient_row[5] if event_type == "SGBXI" else 0,
+                            "address": address,
+                            "debtor_number": patient_row[10]
                         },
                         "services": [
                             {
@@ -485,26 +527,34 @@ def get_private_invoice_cases(invoicing_month=None, invoice_id=None):
         else:
             # Get all billable invoices for month
             c.execute("""
-                SELECT ce.care_event_id, ce.patient_id, ce.invoicing_month, ce.invoice_number,
-                       ce.amount_owed, ce.sum_covered, ce.sum_total, ce.care_range_begin, ce.care_range_end
+                SELECT ce.care_event_id, ce.patient_id, ce.period_start_date, ce.period_end_date,
+                       bd.invoice_number, bd.amount_owed, bd.sum_covered, bd.sum_total, 
+                       ce.event_type, bd.invoicing_month
                 FROM care_events ce
                 JOIN billing_details bd ON ce.care_event_id = bd.care_event_id
-                WHERE ce.invoicing_month = ? AND ce.event_type IN ('SGBXI', 'Entleistung')
-                AND bd.payment_status = 'invoice_needed'
+                WHERE bd.invoicing_month = ? AND ce.event_type IN ('SGBXI', 'Entleistung')
+                AND bd.billing_status = 'invoice_needed'
             """, (invoicing_month,))
             
             for row in c.fetchall():
-                care_event_id, patient_id, month, inv_num, amt_owed, sum_cov, sum_tot, range_begin, range_end = row
+                care_event_id, patient_id, care_start, care_end, inv_num, amt_owed, sum_cov, sum_tot, event_type, month = row
                 
-                # Get patient
-                c.execute("SELECT patient_id, patient_name, insurance_number, birthdate, care_level FROM patient_profiles WHERE patient_id = ?", (patient_id,))
+                # Get patient (including include_service_packet flag, address, and debtor_id)
+                c.execute("SELECT patient_id, patient_name, insurance_number, date_of_birth, care_level, include_service_packet, street_name, street_number, postal_code, city, debtor_id FROM patient_profiles WHERE patient_id = ?", (patient_id,))
                 patient_row = c.fetchone()
                 
                 # Get services
-                c.execute("SELECT service_id, code, description, quantity, unit_price, total_price FROM care_services_new WHERE care_event_id = ?", (care_event_id,))
+                c.execute("SELECT service_id, service_code, service_description, quantity_value, unit_price, line_total FROM care_services_new WHERE care_event_id = ?", (care_event_id,))
                 services_rows = c.fetchall()
                 
                 if patient_row:
+                    # Construct address from split fields
+                    street_name = patient_row[6] or ""
+                    street_number = patient_row[7] or ""
+                    postal_code = patient_row[8] or ""
+                    city = patient_row[9] or ""
+                    address = f"{street_name} {street_number} {postal_code} {city}".strip()
+                    
                     case = {
                         "invoice": {
                             "id": care_event_id,
@@ -513,15 +563,19 @@ def get_private_invoice_cases(invoicing_month=None, invoice_id=None):
                             "amount_owed": amt_owed,
                             "sum_covered": sum_cov,
                             "sum_total": sum_tot,
-                            "care_range_begin": range_begin,
-                            "care_range_end": range_end
+                            "care_range_begin": care_start,
+                            "care_range_end": care_end,
+                            "event_type": event_type
                         },
                         "patient": {
                             "id": patient_row[0],
                             "name": patient_row[1],
                             "insurance_number": patient_row[2],
                             "birthdate": patient_row[3],
-                            "care_level": patient_row[4]
+                            "care_level": patient_row[4],
+                            "include_service_packet": patient_row[5] if event_type == "SGBXI" else 0,
+                            "address": address,
+                            "debtor_number": patient_row[10]
                         },
                         "services": [
                             {
@@ -535,6 +589,85 @@ def get_private_invoice_cases(invoicing_month=None, invoice_id=None):
                         ]
                     }
                     cases.append(case)
+    
+    return cases
+
+
+def get_orphaned_service_packet_cases(invoicing_month):
+    """
+    Get patients with include_service_packet=1 but NO SGBXI invoice in the month.
+    These patients should still receive an invoice for just the service packet fee.
+    
+    Returns list of synthetic invoice cases with only service packet fee.
+    """
+    cases = []
+    with get_db() as conn:
+        c = conn.cursor()
+        
+        # Find patients with service_packet flag but NO SGBXI invoices in this month
+        c.execute("""
+            SELECT DISTINCT pp.patient_id, pp.patient_name, pp.insurance_number, 
+                   pp.date_of_birth, pp.care_level
+            FROM patient_profiles pp
+            WHERE pp.include_service_packet = 1
+            AND NOT EXISTS (
+                SELECT 1 FROM care_events ce
+                WHERE ce.patient_id = pp.patient_id
+                AND ce.event_type = 'SGBXI'
+                AND EXISTS (
+                    SELECT 1 FROM billing_details bd
+                    WHERE bd.care_event_id = ce.care_event_id
+                    AND bd.invoicing_month = ?
+                    AND bd.billing_status = 'invoice_needed'
+                )
+            )
+        """, (invoicing_month,))
+        
+        for row in c.fetchall():
+            patient_id, patient_name, insurance_number, birthdate, care_level = row
+            
+            # Fetch address and debtor_id for orphaned service packet cases
+            c.execute("SELECT street_name, street_number, postal_code, city, debtor_id FROM patient_profiles WHERE patient_id = ?", (patient_id,))
+            address_row = c.fetchone()
+            
+            # Construct address from split fields
+            if address_row:
+                street_name = address_row[0] or ""
+                street_number = address_row[1] or ""
+                postal_code = address_row[2] or ""
+                city = address_row[3] or ""
+                address = f"{street_name} {street_number} {postal_code} {city}".strip()
+                debtor_id = address_row[4]
+            else:
+                address = ""
+                debtor_id = None
+            
+            # Create synthetic invoice case for service packet only
+            case = {
+                "invoice": {
+                    "id": f"service_packet_{patient_id}_{invoicing_month}",
+                    "invoicing_month": invoicing_month,
+                    "invoice_number": None,  # Will be assigned during generation
+                    "amount_owed": 40.00,
+                    "sum_covered": 0.0,
+                    "sum_total": 40.00,
+                    "care_range_begin": None,
+                    "care_range_end": None,
+                    "event_type": "ServicePacket"
+                },
+                "patient": {
+                    "id": patient_id,
+                    "name": patient_name,
+                    "insurance_number": insurance_number,
+                    "birthdate": birthdate,
+                    "care_level": care_level,
+                    "include_service_packet": 1,
+                    "address": address,
+                    "debtor_number": debtor_id
+                },
+                "services": []  # No actual services, just the packet fee
+            }
+            cases.append(case)
     
     return cases
 
@@ -630,7 +763,7 @@ def check_service_fields(auto_fix=False):
             if auto_fix:
                 correct_quantity_str = f"{calculated_quantity:.2f}"
                 cursor.execute("""
-                    UPDATE care_services_new SET quantity = ? WHERE service_id = ?
+                    UPDATE care_services_new SET quantity_value = ? WHERE service_id = ?
                 """, (correct_quantity_str, service_id))
                 logger.info(f"Service {service_id}: auto-fixed quantity to {correct_quantity_str}.")
             else:
@@ -641,7 +774,7 @@ def check_service_fields(auto_fix=False):
 
         conn.commit()
 
-def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = False) -> int:
+def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = False, legacy_entleistung: bool = False) -> int:
     """
     Create billing_details rows for care_events that need invoicing.
     
@@ -652,15 +785,20 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
     - payment_status = 'invoice_needed'
     
     Entleistung Logic:
-    - Track cumulative usage per patient per calendar year
-    - Yearly limit: 125 EUR × 12 = 1,500 EUR per year
-    - If cumulative ≤ 1,500 EUR → NO billing_details created (covered by insurance)
-    - If cumulative > 1,500 EUR → billing_details created with payment_status = 'invoice_needed'
+    - NEW (default, legacy_entleistung=False):
+      * Track cumulative usage per patient per calendar year
+      * Yearly limit: 125 EUR × 12 = 1,500 EUR per year
+      * If cumulative ≤ 1,500 EUR → NO billing_details created (covered by insurance)
+      * If cumulative > 1,500 EUR → billing_details created with payment_status = 'invoice_needed'
+    - LEGACY (legacy_entleistung=True):
+      * Simple monthly logic: If sum_total > 125 EUR → create billing_details
+      * Otherwise → NO billing_details (covered by insurance)
     
     SGBV/Verhinderungspflege/Consultation:
     - Never create billing_details (non-billable)
     
     invoicing_month format: MMYYYY (e.g., "012025" for January 2025)
+    legacy_entleistung: If True, use old logic (>125 EUR per month). If False, use new cumulative yearly logic.
     
     Returns number of billing_details rows created.
     """
@@ -707,8 +845,14 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
             if event_type == "SGBXI":
                 investitionskosten = sum_total * 0.06
             
-            # amount_owed = sum_total - sum_covered + investitionskosten (all numeric, no parsing)
-            amount_owed = sum_total - sum_covered + investitionskosten
+            # For Entleistung, special handling: insurance covers up to 127.35 EUR
+            if event_type == "Entleistung":
+                ENTLEISTUNG_CAP = 127.35
+                sum_covered = min(sum_total, ENTLEISTUNG_CAP)
+                amount_owed = sum_total - sum_covered
+            else:
+                # amount_owed = sum_total - sum_covered + investitionskosten (all numeric, no parsing)
+                amount_owed = sum_total - sum_covered + investitionskosten
             
             # Determine if invoice should be created
             should_create_billing = False
@@ -720,48 +864,58 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
                 billing_status = "invoice_needed"
             
             elif event_type == "Entleistung":
-                # Entleistung: Check cumulative usage for the year
-                year = int(invoicing_month[-4:])
-                
-                # Get current cumulative amount for this patient in this year
-                c.execute("""
-                    SELECT cumulative_amount FROM entlastungsleistung_tracking
-                    WHERE patient_id = ? AND calendar_year = ?
-                """, (patient_id, year))
-                
-                tracking_row = c.fetchone()
-                cumulative = float(tracking_row[0]) if tracking_row and tracking_row[0] else 0.0
-                
-                new_cumulative = cumulative + sum_total
-                
-                # Check against yearly limit: 125 EUR × 12 = 1,500 EUR
-                YEARLY_LIMIT = 1500.0
-                
-                if new_cumulative > YEARLY_LIMIT:
-                    # Exceeds limit → create billing_details
-                    should_create_billing = True
-                    billing_status = "invoice_needed"
+                # Entleistung: Branch based on legacy_entleistung flag
+                if legacy_entleistung:
+                    # LEGACY LOGIC: Simple monthly threshold (anything > 127.35 EUR)
+                    MONTHLY_THRESHOLD = 127.35
+                    if sum_total > MONTHLY_THRESHOLD:
+                        should_create_billing = True
+                        billing_status = "invoice_needed"
+                    else:
+                        should_create_billing = False
                 else:
-                    # Within limit → NO billing_details (covered by insurance)
-                    should_create_billing = False
-                
-                # Update cumulative tracking
-                tracking_id = generate_id("trk")
-                c.execute("""
-                    INSERT INTO entlastungsleistung_tracking 
-                    (tracking_id, org_id, patient_id, calendar_year, cumulative_amount, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(org_id, patient_id, calendar_year) DO UPDATE SET
-                        cumulative_amount = excluded.cumulative_amount,
-                        last_updated = CURRENT_TIMESTAMP
-                """, (
-                    tracking_id,
-                    'org_default',
-                    patient_id,
-                    year,
-                    new_cumulative,
-                    datetime.now().isoformat()
-                ))
+                    # NEW LOGIC: Cumulative yearly limit (125 EUR × 12 = 1,500 EUR per year)
+                    year = int(invoicing_month[-4:])
+                    
+                    # Get current cumulative amount for this patient in this year
+                    c.execute("""
+                        SELECT cumulative_amount FROM entlastungsleistung_tracking
+                        WHERE patient_id = ? AND calendar_year = ?
+                    """, (patient_id, year))
+                    
+                    tracking_row = c.fetchone()
+                    cumulative = float(tracking_row[0]) if tracking_row and tracking_row[0] else 0.0
+                    
+                    new_cumulative = cumulative + sum_total
+                    
+                    # Check against yearly limit: 125 EUR × 12 = 1,500 EUR
+                    YEARLY_LIMIT = 1500.0
+                    
+                    if new_cumulative > YEARLY_LIMIT:
+                        # Exceeds limit → create billing_details
+                        should_create_billing = True
+                        billing_status = "invoice_needed"
+                    else:
+                        # Within limit → NO billing_details (covered by insurance)
+                        should_create_billing = False
+                    
+                    # Update cumulative tracking (only for new logic)
+                    tracking_id = generate_id("trk")
+                    c.execute("""
+                        INSERT INTO entlastungsleistung_tracking 
+                        (tracking_id, org_id, patient_id, calendar_year, cumulative_amount, last_updated)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(org_id, patient_id, calendar_year) DO UPDATE SET
+                            cumulative_amount = excluded.cumulative_amount,
+                            last_updated = CURRENT_TIMESTAMP
+                    """, (
+                        tracking_id,
+                        'org_default',
+                        patient_id,
+                        year,
+                        new_cumulative,
+                        datetime.now().isoformat()
+                    ))
             
             # Create billing_details ONLY if invoice is needed
             if should_create_billing:
@@ -788,5 +942,55 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
 
         conn.commit()
         changes = conn.total_changes - before
-        logger.info(f"Created {billing_rows_created} billing_details rows in {invoicing_month}: SGBXI=all, Entleistung=only if exceeds 1500 EUR limit")
+        entleistung_logic = "legacy (>125 EUR/month)" if legacy_entleistung else "new (yearly cumulative 1500 EUR)"
+        logger.info(f"Created {billing_rows_created} billing_details rows in {invoicing_month}: SGBXI=all, Entleistung={entleistung_logic}")
         return billing_rows_created
+
+def validate_and_fix_sgbxi_amounts():
+    """
+    Validate all SGBXI care_events and auto-correct reversed sum_covered/sum_total.
+    
+    Rule: sum_covered must ALWAYS be <= sum_total (insurance cannot pay more than total)
+    If sum_covered > sum_total, automatically swap them.
+    
+    Returns:
+        dict with 'corrected_count', 'errors', 'total_checked'
+    """
+    with get_db() as conn:
+        c = conn.cursor()
+        
+        # Find all SGBXI records where sum_covered > sum_total (logically impossible)
+        c.execute("""
+            SELECT care_event_id, sum_covered, sum_total 
+            FROM care_events 
+            WHERE event_type = 'SGBXI' AND sum_covered > sum_total
+        """)
+        
+        reversed_records = c.fetchall()
+        corrected_count = 0
+        
+        for care_event_id, sum_covered, sum_total in reversed_records:
+            # Swap them
+            c.execute("""
+                UPDATE care_events 
+                SET sum_covered = ?, sum_total = ? 
+                WHERE care_event_id = ?
+            """, (sum_total, sum_covered, care_event_id))
+            
+            logger.warning(
+                f"✓ AUTO-CORRECTED SGBXI {care_event_id}: "
+                f"swapped sum_covered={sum_covered:.2f} <-> sum_total={sum_total:.2f}"
+            )
+            corrected_count += 1
+        
+        # Get total SGBXI count for reporting
+        c.execute("SELECT COUNT(*) FROM care_events WHERE event_type = 'SGBXI'")
+        total_sgbxi = c.fetchone()[0]
+        
+        conn.commit()
+        
+        return {
+            'corrected_count': corrected_count,
+            'total_checked': total_sgbxi,
+            'errors': []
+        }

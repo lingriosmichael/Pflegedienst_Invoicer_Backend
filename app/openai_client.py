@@ -116,18 +116,14 @@ def build_prompt(attempt=0):
       4. Note: All monetary values must be formatted in German style, using ',' for decimals and '.' for thousands (e.g. "1.234,56").
          That means: unit price, total, summe_covered, summe_total
       
-      CRITICAL: After the "Summe €" label, extract the FIRST monetary value as summe_covered and the SECOND as summe_total.
-      These may appear on the same line or on the next lines. For example:
+      CRITICAL: After "Summe €" there are ALWAYS exactly two numbers:
+      - FIRST number = summe_total (total service costs)
+      - SECOND number = summe_covered (insurance covered amount)
       
-      If on next lines:
-        Summe €
-        1.068,57
-        1.068,57
-      Then: summe_covered = 1.068,57, summe_total = 1.068,57
-      
-      If on same line:
-        Summe €    1.068,57    1.068,57
-      Then: summe_covered = 1.068,57, summe_total = 1.068,57
+      Example from Kostenträger format:
+      Summe €
+      2.148,60        (FIRST = summe_total)
+      1.859,00        (SECOND = summe_covered)
       
       Types of Sample block:
       Verordnung: 01.03.25 

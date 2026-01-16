@@ -123,13 +123,6 @@ def split_into_chunks(text):
         # Note: summe_covered and summe_total will be extracted by OpenAI from the text
         final_text += f'\n"invoice": {{\n    "pflegezeitraum_beginn": {pflegezeitraum_beginn},\n    "pflegezeitraum_ende": {pflegezeitraum_ende}\n}}'
 
-        # Debug logging for SGBV
-        if "pflegekonto: 4092" in final_text.lower():
-            logger.info("=" * 80)
-            logger.info("[SGBV CHUNK] About to send to OpenAI")
-            logger.info(f"[SGBV CHUNK] Full text:\n{final_text}")
-            logger.info("=" * 80)
-
         # Ensure each chunk is small enough for the OpenAI model.
         # Use configurable max tokens from ParsingConfig.
         MODEL = "gpt-5-mini-2025-08-07"
@@ -264,14 +257,6 @@ def process_import_sgbxi(text_chunks, abrechnungsmonat):
             chunk_id = chunk_entry.get("chunk_id") if isinstance(chunk_entry, dict) else None
             chunk_texts.append(chunk_text)
             chunk_metadata.append({"chunk_id": chunk_id, "chunk_entry": chunk_entry})
-            
-            # Log SGBV chunks before sending to OpenAI
-            if "pflegekonto: 4092" in chunk_text.lower():
-                print(f"\n[SGBV CHUNK BEFORE OpenAI] Chunk ID: {chunk_id}")
-                print("=" * 80)
-                print(chunk_text[:500])  # First 500 chars
-                print("..." if len(chunk_text) > 500 else "")
-                print("=" * 80)
         
         # Get batch extraction results
         try:

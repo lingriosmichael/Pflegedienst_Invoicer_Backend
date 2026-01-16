@@ -8,22 +8,21 @@
       font-family: Arial, sans-serif;
       font-size: 12px;
       color: #000;
-      margin: 10px 15px;
-      padding: 0;
+      margin: 20px;
     }
     .header {
       font-size: 8px;
-      margin-bottom: 4px;
+      margin-bottom: 5px;
     }
     .header hr {
       border: none;
       border-top: 1px solid #000;
-      margin: 1px 0;
+      margin: 5px 0;
     }
-    .footer { margin-top: 15px; }
+    .footer { margin-top: 30px; }
     .right { text-align: right; }
     .right p { margin: 1px 0; }
-    .invoice-title { font-size: 26px; font-weight: bold; margin-bottom: 0; margin-top: 0; }
+    .invoice-title { font-size: 26px; font-weight: bold; margin-bottom: 0; }
     .meta-block {
       float: right;
       text-align: right;
@@ -31,50 +30,50 @@
     }
     .meta-block p { margin: 1px 0; }
     .info-block { margin-top: 15px; font-size: 14px; margin-bottom: 0; }
-    .info-block p { margin: 3px 0; }
+    .info-block p { margin: 8px 0; }
     table {
       width: 100%;
       border-collapse: collapse;
-      margin-top: 8px;
+      margin-top: 20px;
       border: none;
     }
     th, td {
       border: none;
-      padding: 3px 6px;
+      padding: 6px;
       text-align: left;
     }
     .totals td {
       border: none;
       padding-top: 20px;
-      padding-bottom: 10px;
+      padding-bottom: 20px;
     }
     .invoice-total {
       font-size: 14px;
       font-weight: bold;
       text-align: right;
     }
-    @page {
-      size: A4;
-      margin: 2cm 2cm 3.8cm 2cm; /* reduced margins */
-      @bottom-center {
-        content: element(footer);
-      }
+   @page {
+    size: A4;
+    margin: 2cm 2cm 3.8cm 2cm; /* reserve space at bottom */
+    @bottom-center {
+      content: element(footer);
     }
-    #footer table {
-    width: 100%;
-    table-layout: fixed;
-    }
-    #footer td {
-      vertical-align: top;
-      width: 33%; /* force even column width */
-    }
-    #footer {
-      font-size: 10px;
-      display: block;
-      position: running(footer); /* this marks it for use in @page */
-      border-top: 1px solid black;
-      padding-top: 5px;
-    }
+  }
+  #footer table {
+  width: 100%;
+  table-layout: fixed;
+  }
+  #footer td {
+    vertical-align: top;
+    width: 33%; /* force even column width */
+  }
+  #footer {
+    font-size: 10px;
+    display: block;
+    position: running(footer); 
+    border-top: 1px solid black;
+    padding-top: 5px;
+  }
   </style>
 </head>
 <body>
@@ -99,8 +98,7 @@
     <p style="font-size: 9px;">Bei Zahlungen bitte immer Rechnung-Nr angeben!</p>
   </div>
 
-  <br><br><br><br><br>
-  <br><br><br>
+  <br><br><br><br><br><br>
 
   <div class="invoice-title">Abrechnung</div>
   <div class="info-block">
@@ -108,22 +106,16 @@
     <p><strong>{{ patient.name }}, geb. am {{ patient.birthdate }}</strong></p>
     <p>{{ address_line1 }}, {{ address_line2 }}</p>
   </div>
-  <br><br>
+
   <div class="right">
     <p>Versich.-Nr.: <strong>{{ patient.insurance_number }}</strong></p>
     <p>Pflegegrad: <strong>{{ patient.care_level }}</strong> Ambulant</p>
   </div>
 
-
-  {% set pflegesumme = invoice.sum_total | float %}
-  {% set invest = pflegesumme * 0.06 %}
   {% set covered = invoice.sum_covered | float %}
-  {# Use per-patient flag stored in the database to determine service packet inclusion #}
-  {% set needs_service_paket = (patient.include_service_packet | int) == 1 %}
-  {% set service_fee = 40.00 if needs_service_paket else 0.00 %}
-  {% set final_total = pflegesumme + invest + service_fee - covered %}
+  {% set amount_owed = invoice.amount_owed | float %}
 
-  <br>
+  <br><br><br>
   <table>
     <thead>
       <tr>
@@ -135,46 +127,23 @@
       </tr>
     </thead>
     <tbody>
-      {% for item in services %}
       <tr>
-        <td>{{ item.code }}</td>
-        <td>{{ item.description }}</td>
-        <td>{{ item.quantity }}</td>
-        <td>{% if item.unit_price %}{{ item.unit_price | german_number }} EUR{% endif %}</td>
-        <td>{% if item.total_price %}{{ item.total_price | german_number }} EUR{% endif %}</td>
+        <td>1000001</td>
+        <td>Service Paket nach § 45b SGB XI</td>
+        <td>1</td>
+        <td>40,00 EUR</td>
+        <td>40,00 EUR</td>
       </tr>
-      {% endfor %}
-      <tr>
-        <td></td>
-        <td>Investitionskosten 6% von Pflegesumme</td>
-        <td></td>
-        <td></td>
-        <td>{{ invest | german_number }} EUR</td>
-      </tr>
-      <tr>
-        <td></td>
-        <td>Abzug Pflegegrad</td>
-        <td></td>
-        <td></td>
-        <td>-{{ invoice.sum_covered | german_number }} EUR</td>
-      </tr>
-      {% if needs_service_paket %}
-      <tr>
-        <td></td>
-        <td>Service Paket</td>
-        <td></td>
-        <td></td>
-        <td>{{ service_fee | german_number }} EUR</td>
-      </tr>
-      {% endif %}
     </tbody>
   </table>
+
+  <br><br>
   <table class="totals">
     <tr>
-      <td class="invoice-total" colspan="5">Rechnungsbetrag: {{ final_total | german_number }} EUR</td>
+      <td class="invoice-total" colspan="5">Rechnungsbetrag: {{ amount_owed | german_number }} EUR</td>
     </tr>
   </table>
-
+  <br>
   <div class="footer">
     <p>Bitte überweisen Sie den Betrag innerhalb 1 Woche auf u.g. Konto.<br><br>
     Mit freundlichen Grüßen</p>

@@ -155,15 +155,18 @@ def process_generate_invoices(invoicing_month=None):
     for case in cases:
         try:
             current_number = case["invoice"].get("invoice_number")
-            invoice_id = case["invoice"].get("invoice_id")
+            care_event_id = case["invoice"]["id"]
 
             # Assign invoice number atomically if missing
             if not current_number:
                 assigned_number = InvoiceRepository.get_next_invoice_number()
                 case["invoice"]["invoice_number"] = assigned_number
                 # Update in DB using repository (only if this is a real care event, not synthetic)
-                if not case["invoice"]["id"].startswith("service_packet_"):
-                    InvoiceRepository.update_invoice_number(invoice_id, assigned_number)
+                if not care_event_id.startswith("service_packet_"):
+                    InvoiceRepository.update_invoice_number(care_event_id, assigned_number)
+                logger.info(f"Assigned invoice number {assigned_number} to care_event {care_event_id}")
+            else:
+                logger.info(f"Using existing invoice number {current_number} for care_event {care_event_id}")
 
             path = generate_invoice_pdf(case)
             logger.info(f"PDF created: {path}")

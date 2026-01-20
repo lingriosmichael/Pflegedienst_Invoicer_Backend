@@ -86,9 +86,6 @@ class ProcessRequest(BaseModel):
 class InvoiceRequest(BaseModel):
     abrechnungsmonat: str
 
-class RegenerateRequest(BaseModel):
-    invoice_num: str
-
 
 # ------------------------------
 # Startup
@@ -265,11 +262,6 @@ def retry_failed():
     pdf_parser.refeed_failed_chunk_from_file()
     return {"status": "ok", "message": "Fehlerhafte Abrechnungen erneut verarbeitet"}
 
-
-@app.post("/regenerate_invoice")
-def regenerate_invoice(req: RegenerateRequest):
-    invoice_generator.regenerate_invoice(req.invoice_num)
-    return {"status": "ok", "message": f"Rechnung {req.invoice_num} wurde neu erstellt"}
 
 @app.post("/prepare_pdf")
 def prepare_pdf(req: ProcessRequest):

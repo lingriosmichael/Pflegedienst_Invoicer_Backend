@@ -1,59 +1,63 @@
 """
-Simple dashboard using direct SQL queries to get invoice data.
-No AI agent needed - just restructure SQL results for charting.
+Chart data generation using MongoDB aggregation queries.
+Generates data for dashboards and visualizations.
 """
 from typing import Dict, Any, List
+from datetime import datetime
 from app.core.logging import get_logger
-from app.db.connection import get_db
+from app.db import CareEventRepository, PatientRepository
 
 logger = get_logger(__name__)
 
 
 def generate_patient_histogram(patient_id: str) -> Dict[str, Any]:
     """
-    Generate histogram of invoice amounts by month for a specific patient from unified schema.
-    Queries SGBXI and Entleistung events grouped by month (from period_start_date).
+    Generate histogram of invoice amounts by month for a specific patient.
+    Uses MongoDB aggregation to get SGBXI and Entleistung events grouped by type and month.
     
     Args:
         patient_id: The ID (string) of the patient to generate the histogram for
         
     Returns:
-        Dictionary with data array ready for charting
+        Dictionary with data array ready for charting and title
+        
+    Example:
+        result = generate_patient_histogram("pat_123")
+        # Returns: {
+        #     "data": [
+        #         {"month": "01/2025", "SGBXI": 100.00, "Entleistung": 50.00},
+        #         {"month": "02/2025", "SGBXI": 150.00, "Entleistung": 0.00}
+        #     ],
+        #     "title": "Invoice Amounts by Month"
+        # }
     """
     try:
-        from datetime import datetime
+        # Use MongoDB aggregation to get data grouped by event_type and date
+        aggregation_results = CareEventRepository.get_patient_histogram(
+            patient_id=patient_id,
+            event_types=["SGBXI", "Entleistung"]
+        )
         
-        with get_db() as conn:
-            c = conn.cursor()
+        if not aggregation_results:
+            logger.warning(f"No SGBXI/Entleistung events found for patient {patient_id}")
+            return {
+                "data": [],
+                "title": "No Data"
+            }
+        
+        # Convert aggregation results to chart format
+        month_data = {}
+        years_present = set()
+        
+        for result in aggregation_results:
+            id_info = result.get("_id", {})
+            event_type = id_info.get("event_type", "")
+            date_str = id_info.get("date", "")
+            monthly_total = result.get("monthly_total", 0)
             
-            # Get monthly totals for SGBXI and Entleistung separately
-            c.execute("""
-                SELECT 
-                  event_type,
-                  period_start_date,
-                  SUM(sum_total) as monthly_total
-                FROM care_events
-                WHERE patient_id = ? AND event_type IN ('SGBXI', 'Entleistung')
-                GROUP BY event_type, period_start_date
-                ORDER BY period_start_date
-            """, (patient_id,))
-            
-            rows = c.fetchall()
-            
-            if not rows:
-                logger.warning(f"No SGBXI/Entleistung events found for patient {patient_id}")
-                return {
-                    "data": [],
-                    "title": "No Data"
-                }
-            
-            # Group by month and event type
-            month_data = {}
-            years_present = set()
-            
-            for event_type, date_str, monthly_total in rows:
-                # Parse date from DD.MM.YY format
+            if date_str:
                 try:
+                    # Parse date from DD.MM.YY format
                     date_str = date_str.strip()
                     dt = datetime.strptime(date_str, "%d.%m.%y")
                     month_key = dt.strftime("%m%Y")
@@ -75,34 +79,35 @@ def generate_patient_histogram(patient_id: str) -> Dict[str, Any]:
                     month_data[month_key] = {"display": month_display, "SGBXI": 0.0, "Entleistung": 0.0}
                 
                 # Add amount to the appropriate event type
-                month_data[month_key][event_type] += amount
-            
-            # Fill in all 12 months for each year present
-            if years_present:
-                for year in sorted(years_present):
-                    for month_num in range(1, 13):
-                        month_key = f"{month_num:02d}{year}"
-                        if month_key not in month_data:
-                            month_display = f"{month_num:02d}/{year}"
-                            month_data[month_key] = {"display": month_display, "SGBXI": 0.0, "Entleistung": 0.0}
-            
-            # Convert to sorted array format for charting
-            chart_data = []
-            for month_key in sorted(month_data.keys()):
-                entry = {
-                    "month": month_data[month_key]["display"],
-                    "SGBXI": round(month_data[month_key]["SGBXI"], 2),
-                    "Entleistung": round(month_data[month_key]["Entleistung"], 2),
-                }
-                chart_data.append(entry)
-            
-            logger.info(f"Generated histogram for patient {patient_id} with {len(chart_data)} months of data")
-            
-            return {
-                "data": chart_data,
-                "title": f"Invoice Amounts by Month"
+                if event_type in ["SGBXI", "Entleistung"]:
+                    month_data[month_key][event_type] += amount
+        
+        # Fill in all 12 months for each year present
+        if years_present:
+            for year in sorted(years_present):
+                for month_num in range(1, 13):
+                    month_key = f"{month_num:02d}{year}"
+                    if month_key not in month_data:
+                        month_display = f"{month_num:02d}/{year}"
+                        month_data[month_key] = {"display": month_display, "SGBXI": 0.0, "Entleistung": 0.0}
+        
+        # Convert to sorted array format for charting
+        chart_data = []
+        for month_key in sorted(month_data.keys()):
+            entry = {
+                "month": month_data[month_key]["display"],
+                "SGBXI": round(month_data[month_key]["SGBXI"], 2),
+                "Entleistung": round(month_data[month_key]["Entleistung"], 2),
             }
-            
+            chart_data.append(entry)
+        
+        logger.info(f"Generated histogram for patient {patient_id} with {len(chart_data)} months of data")
+        
+        return {
+            "data": chart_data,
+            "title": f"Invoice Amounts by Month"
+        }
+        
     except Exception as e:
         logger.error(f"Error generating histogram for patient {patient_id}: {e}", exc_info=True)
         return {
@@ -113,27 +118,23 @@ def generate_patient_histogram(patient_id: str) -> Dict[str, Any]:
 
 def get_all_patients() -> List[Dict]:
     """
-    Get all patients in the database from unified schema.
+    Get all patients in the database.
     
     Returns:
         List of dicts with id (patient_id) and name (patient_name)
     """
     try:
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT patient_id, patient_name FROM patient_profiles ORDER BY patient_name")
-            rows = c.fetchall()
-            
-            result = []
-            for row in rows:
-                patient_id, patient_name = row
-                result.append({
-                    "id": patient_id,
-                    "name": patient_name
-                })
-            
-            return result
+        patients = PatientRepository.find_all()
+        
+        result = []
+        for patient in patients:
+            result.append({
+                "id": patient.get("patient_id"),
+                "name": patient.get("patient_name")
+            })
+        
+        logger.info(f"Fetched {len(result)} patients")
+        return result
     except Exception as e:
         logger.error(f"Error fetching patients: {e}")
         return []
-

@@ -1,15 +1,10 @@
 from fastapi import FastAPI, UploadFile, File, Form, Request
 from pydantic import BaseModel
+from typing import List, Optional
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi import HTTPException
-from app.ai_schema import router as ai_schema_router
-from app.openai_client import ( 
-                               generate_sql_from_question, 
-                               execute_sql, 
-                               generate_visualization
-                               )
 import traceback
 import shutil
 import os
@@ -17,7 +12,7 @@ import asyncio
 import app.database as database
 import app.invoice_generator as invoice_generator
 import app.pdf_parser as pdf_parser
-from app.db.migrations import migrate_care_records_to_services_table, migrate_verhinderungspflege_event_types
+from app.db import create_collections_and_indexes
 import uuid
 from datetime import datetime
 import logging
@@ -27,7 +22,6 @@ logger = get_logger(__name__)
 setup_logging()
 
 app = FastAPI()
-app.include_router(ai_schema_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -93,10 +87,11 @@ class InvoiceRequest(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     try:
-        database.init_db()
-        # Run migrations for existing databases
-        migrate_care_records_to_services_table()
-        migrate_verhinderungspflege_event_types()
+        # Initialize MongoDB collections and indexes
+        logger.info("Initializing MongoDB...")
+        create_collections_and_indexes()
+        logger.info("✓ MongoDB collections initialized")
+            
     except Exception as e:
         logger.error(f"Failed to init database: {e}")
 
@@ -313,43 +308,35 @@ def dashboard(request: Request):
 
 @app.get("/chunks/browse", response_class=HTMLResponse)
 def browse_chunks(request: Request, patient_name: str | None = None):
-    """Simple UI view to inspect chunk metadata and linked invoices."""
-    from app.db.connection import get_db
-
-    base_query = """
-    SELECT
-        c.id, c.patient_name, c.source_pdf, c.text_preview, c.created_at,
-        i.id, i.amount_owed, i.invoicing_month
-    FROM chunks c
-    LEFT JOIN invoices i ON i.origin_chunk_id = c.id
-    """
-    params: list[str] = []
-    filters = []
+    """Simple UI view to inspect chunk metadata and linked invoices (MongoDB version)."""
+    from app.db.mongodb_config import get_database
+    
+    db = get_database()
+    
+    # Build query filter
+    query = {}
     if patient_name:
-        filters.append("c.patient_name LIKE ?")
-        params.append(f"%{patient_name}%")
-
-    if filters:
-        base_query += " WHERE " + " AND ".join(filters)
-
-    base_query += " ORDER BY c.created_at DESC LIMIT 300"
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(base_query, tuple(params))
-        rows = cursor.fetchall()
-
+        query["patient_name"] = {"$regex": patient_name, "$options": "i"}
+    
+    # Get chunks from MongoDB
+    chunks_cursor = db.chunks.find(query).sort("created_at", -1).limit(300)
+    
     chunks = []
-    for row in rows:
+    for chunk_doc in chunks_cursor:
+        chunk_id = chunk_doc.get("chunk_id") or str(chunk_doc.get("_id"))
+        
+        # Look up any associated care_events
+        care_event = db.care_events.find_one({"origin_chunk_id": chunk_id})
+        
         chunks.append({
-            "chunk_id": row[0],
-            "patient_name": row[1] or "",
-            "source_pdf": row[2],
-            "text_preview": row[3],
-            "created_at": row[4],
-            "invoice_id": row[5],
-            "amount_owed": row[6],
-            "invoicing_month": row[7],
+            "chunk_id": chunk_id,
+            "patient_name": chunk_doc.get("patient_name", ""),
+            "source_pdf": chunk_doc.get("source_pdf", ""),
+            "text_preview": chunk_doc.get("text", "")[:200] if chunk_doc.get("text") else "",
+            "created_at": str(chunk_doc.get("created_at", "")),
+            "invoice_id": care_event.get("care_event_id") if care_event else None,
+            "amount_owed": care_event.get("amount_owed") if care_event else None,
+            "invoicing_month": care_event.get("invoicing_month") if care_event else None,
         })
 
     return templates.TemplateResponse("rag_chunks.html", {
@@ -501,26 +488,6 @@ async def validate_sgbxi_amounts():
     except Exception as e:
         logger.error(f"/validate_sgbxi_amounts error:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
-    
-@app.post("/ai/visualize")
-async def ai_visualize(request: Request):
-    """
-    Generates both SQL and visualization (chart or table)
-    based on a natural-language question.
-    """
-    body = await request.json()
-    question = body.get("question")
-    mode = body.get("mode", "auto")
-
-    if not question:
-        raise HTTPException(status_code=400, detail="Missing 'question'")
-
-    try:
-        result = generate_visualization(question, mode)
-        return result
-    except Exception as e:
-        logger.error(f"AI visualization error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 # ------------------------------
 # Patient CRUD Endpoints
@@ -540,100 +507,108 @@ class PatientRequest(BaseModel):
 
 @app.get("/patients")
 def list_patients():
-    """List all patients from unified schema (patient_profiles table)."""
+    """List all patients from MongoDB."""
     try:
-        from app.db.connection import get_db
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT patient_id, patient_name, date_of_birth, insurance_number, care_level, 
-                       street_name, street_number, postal_code, city, include_service_packet, debtor_id
-                FROM patient_profiles
-                ORDER BY patient_name
-            """)
-            rows = c.fetchall()
-            return {
-                "status": "ok",
-                "patients": [
-                    {
-                        "id": r[0],
-                        "name": r[1],
-                        "birthdate": r[2],
-                        "insurance_number": r[3],
-                        "care_level": r[4],
-                        "address": f"{r[5]} {r[6]}, {r[7]} {r[8]}" if r[5] else "",  # Combined address
-                        "street_name": r[5],
-                        "street_number": r[6],
-                        "postal_code": r[7],
-                        "city": r[8],
-                        "debtor_number": r[10] or "",
-                        "include_service_packet": bool(r[9])
-                    }
-                    for r in rows
-                ]
-            }
+        from app.db.mongodb_repositories import PatientRepository
+        
+        patients = PatientRepository.find_all("org_default")
+        return {
+            "status": "ok",
+            "patients": [
+                {
+                    "id": p.get("patient_id"),
+                    "name": p.get("patient_name", ""),
+                    "birthdate": p.get("date_of_birth", ""),
+                    "insurance_number": p.get("insurance_number", ""),
+                    "care_level": p.get("care_level", ""),
+                    "address": f"{p.get('street_name', '')} {p.get('street_number', '')}, {p.get('postal_code', '')} {p.get('city', '')}" if p.get("street_name") else "",
+                    "street_name": p.get("street_name", ""),
+                    "street_number": p.get("street_number", ""),
+                    "postal_code": p.get("postal_code", ""),
+                    "city": p.get("city", ""),
+                    "debtor_number": p.get("debtor_id", "") or "",
+                    "include_service_packet": bool(p.get("include_service_packet", False))
+                }
+                for p in patients
+            ]
+        }
     except Exception as e:
         logger.error(f"/patients error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/patient")
 def create_patient(req: PatientRequest):
-    """Create a new patient in unified schema (patient_profiles table)."""
+    """Create a new patient in MongoDB."""
     try:
-        from app.db.connection import get_db
-        from app.utils.parsing import generate_id
+        from app.db.mongodb_repositories import PatientRepository
+        from app.db.connection import get_database
+        from datetime import datetime
+        import time
         
-        patient_id = generate_id("pat")
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO patient_profiles 
-                (patient_id, org_id, patient_name, date_of_birth, insurance_number, care_level, 
-                 street_name, street_number, postal_code, city, include_service_packet, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                patient_id, 'org_default', req.name, req.birthdate, req.insurance_number, 
-                req.care_level, getattr(req, 'street_name', ''), getattr(req, 'street_number', ''),
-                getattr(req, 'postal_code', ''), getattr(req, 'city', ''),
-                int(req.include_service_packet), datetime.now().isoformat()
-            ))
-            conn.commit()
-            return {"status": "ok", "patient_id": patient_id}
+        # Generate a numeric patient_id (unique timestamp-based ID)
+        # Get the max patient_id from existing patients and increment
+        db = get_database()
+        org_id = "org_default"
+        
+        # Find the highest existing patient_id
+        max_patient = db.patient_profiles.find_one(
+            {"org_id": org_id},
+            sort=[("patient_id", -1)]
+        )
+        
+        if max_patient and max_patient.get("patient_id"):
+            if isinstance(max_patient["patient_id"], int):
+                next_patient_id = max_patient["patient_id"] + 1
+            else:
+                # Fallback: use timestamp-based ID if existing IDs are not integers
+                next_patient_id = int(time.time() * 1000) % (2**31)
+        else:
+            # If no patients exist, start from a reasonable number
+            next_patient_id = 1000
+        
+        patient_data = {
+            "patient_id": next_patient_id,
+            "patient_name": req.name,
+            "date_of_birth": req.birthdate,
+            "insurance_number": req.insurance_number,
+            "care_level": req.care_level,
+            "street_name": getattr(req, 'street_name', ''),
+            "street_number": getattr(req, 'street_number', ''),
+            "postal_code": getattr(req, 'postal_code', ''),
+            "city": getattr(req, 'city', ''),
+            "include_service_packet": bool(req.include_service_packet),
+            "debtor_id": ""
+        }
+        
+        PatientRepository.create(patient_data, org_id)
+        return {"status": "ok", "patient_id": str(next_patient_id)}
     except Exception as e:
         logger.error(f"/patient POST error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/patient/{patient_id}")
 def get_patient(patient_id: str):
-    """Get a single patient by ID from unified schema."""
+    """Get a single patient by ID from MongoDB."""
     try:
-        from app.db.connection import get_db
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT patient_id, patient_name, date_of_birth, insurance_number, care_level, 
-                       street_name, street_number, postal_code, city, include_service_packet
-                FROM patient_profiles WHERE patient_id = ?
-            """, (patient_id,))
-            row = c.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Patient not found")
-            return {
-                "status": "ok",
-                "patient": {
-                    "id": row[0],
-                    "name": row[1],
-                    "birthdate": row[2],
-                    "insurance_number": row[3],
-                    "care_level": row[4],
-                    "street_name": row[5],
-                    "street_number": row[6],
-                    "postal_code": row[7],
-                    "city": row[8],
-                    "address": f"{row[5]} {row[6]}, {row[7]} {row[8]}" if row[5] else "",  # Combined
-                    "include_service_packet": bool(row[9])
-                }
+        from app.db.mongodb_repositories import PatientRepository
+        
+        patient = PatientRepository.find_by_id(patient_id, "org_default")
+        return {
+            "status": "ok",
+            "patient": {
+                "id": patient.get("patient_id"),
+                "name": patient.get("patient_name", ""),
+                "birthdate": patient.get("date_of_birth", ""),
+                "insurance_number": patient.get("insurance_number", ""),
+                "care_level": patient.get("care_level", ""),
+                "street_name": patient.get("street_name", ""),
+                "street_number": patient.get("street_number", ""),
+                "postal_code": patient.get("postal_code", ""),
+                "city": patient.get("city", ""),
+                "address": f"{patient.get('street_name', '')} {patient.get('street_number', '')}, {patient.get('postal_code', '')} {patient.get('city', '')}" if patient.get("street_name") else "",
+                "include_service_packet": bool(patient.get("include_service_packet", False))
             }
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -642,28 +617,51 @@ def get_patient(patient_id: str):
 
 @app.put("/patient/{patient_id}")
 def update_patient(patient_id: str, req: PatientRequest):
-    """Update an existing patient in unified schema."""
+    """Update an existing patient in MongoDB."""
     try:
-        from app.db.connection import get_db
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("""
-                UPDATE patient_profiles
-                SET patient_name = ?, date_of_birth = ?, insurance_number = ?, care_level = ?, 
-                    street_name = ?, street_number = ?, postal_code = ?, city = ?, include_service_packet = ?,
-                    debtor_id = ?, updated_at = ?
-                WHERE patient_id = ?
-            """, (
-                req.name, req.birthdate, req.insurance_number, req.care_level,
-                getattr(req, 'street_name', ''), getattr(req, 'street_number', ''),
-                getattr(req, 'postal_code', ''), getattr(req, 'city', ''),
-                int(req.include_service_packet), getattr(req, 'debtor_number', ''),
-                datetime.now().isoformat(), patient_id
-            ))
-            conn.commit()
-            if c.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Patient not found")
-            return {"status": "ok", "updated": True}
+        from app.db.connection import get_database
+        from datetime import datetime
+        
+        db = get_database()
+        org_id = "org_default"
+        
+        # Try both string and integer formats to handle mixed ID types in DB
+        patient_id_int = None
+        try:
+            patient_id_int = int(patient_id)
+        except (ValueError, TypeError):
+            pass
+        
+        # Query with both possible ID formats
+        query = {"org_id": org_id}
+        if patient_id_int is not None:
+            query["patient_id"] = {"$in": [patient_id, patient_id_int]}
+        else:
+            query["patient_id"] = patient_id
+        
+        update_data = {
+            "patient_name": req.name,
+            "date_of_birth": req.birthdate,
+            "insurance_number": req.insurance_number,
+            "care_level": req.care_level,
+            "street_name": getattr(req, 'street_name', ''),
+            "street_number": getattr(req, 'street_number', ''),
+            "postal_code": getattr(req, 'postal_code', ''),
+            "city": getattr(req, 'city', ''),
+            "include_service_packet": bool(req.include_service_packet),
+            "debtor_id": getattr(req, 'debtor_number', ''),
+            "updated_at": datetime.utcnow()
+        }
+        
+        result = db.patient_profiles.update_one(
+            query,
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        
+        return {"status": "ok", "updated": True}
     except HTTPException:
         raise
     except Exception as e:
@@ -672,24 +670,57 @@ def update_patient(patient_id: str, req: PatientRequest):
 
 @app.delete("/patient/{patient_id}")
 def delete_patient(patient_id: str):
-    """Delete a patient and associated care_events from unified schema."""
+    """Delete a patient and associated care_events from MongoDB."""
     try:
-        from app.db.connection import get_db
-        with get_db() as conn:
-            c = conn.cursor()
-            # Delete care_events and services for this patient (cascade)
-            c.execute("SELECT care_event_id FROM care_events WHERE patient_id = ?", (patient_id,))
-            event_ids = [row[0] for row in c.fetchall()]
-            for evt_id in event_ids:
-                c.execute("DELETE FROM care_services_new WHERE care_event_id = ?", (evt_id,))
-                c.execute("DELETE FROM billing_details WHERE care_event_id = ?", (evt_id,))
-                c.execute("DELETE FROM care_event_history WHERE care_event_id = ?", (evt_id,))
-            c.execute("DELETE FROM care_events WHERE patient_id = ?", (patient_id,))
-            c.execute("DELETE FROM patient_profiles WHERE patient_id = ?", (patient_id,))
-            conn.commit()
-            if c.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Patient not found")
-            return {"status": "ok", "deleted": True}
+        from app.db.connection import get_database
+        
+        db = get_database()
+        org_id = "org_default"
+        
+        logger.info(f"Deleting patient {patient_id}")
+        
+        # Try both string and integer formats to handle mixed ID types in DB
+        patient_id_int = None
+        try:
+            patient_id_int = int(patient_id)
+        except (ValueError, TypeError):
+            pass
+        
+        # Query with both possible ID formats
+        query = {"org_id": org_id}
+        if patient_id_int is not None:
+            query["patient_id"] = {"$in": [patient_id, patient_id_int]}
+        else:
+            query["patient_id"] = patient_id
+        
+        # Find all care_events for this patient and delete related records
+        care_events = list(db.care_events.find(
+            query,
+            {"_id": 0, "care_event_id": 1}
+        ))
+        
+        logger.info(f"Found {len(care_events)} care_events for patient {patient_id}")
+        
+        for event in care_events:
+            evt_id = event.get("care_event_id")
+            if evt_id:
+                logger.debug(f"Deleting billing/history for event {evt_id}")
+                db.billing_details.delete_many({"org_id": org_id, "care_event_id": evt_id})
+                db.care_event_history.delete_many({"org_id": org_id, "care_event_id": evt_id})
+        
+        # Delete all care_events for this patient (using same query)
+        deleted_events = db.care_events.delete_many(query)
+        logger.info(f"Deleted {deleted_events.deleted_count} care_events")
+        
+        # Delete the patient (using same query)
+        result = db.patient_profiles.delete_one(query)
+        
+        if result.deleted_count == 0:
+            logger.warning(f"Patient {patient_id} not found")
+            raise HTTPException(status_code=404, detail="Patient not found")
+        
+        logger.info(f"✓ Successfully deleted patient {patient_id}")
+        return {"status": "ok", "deleted": True}
     except HTTPException:
         raise
     except Exception as e:
@@ -738,155 +769,189 @@ def get_patient_histogram(patient_id: str):
 
 @app.get("/analytics/billing-summary")
 def get_billing_summary():
-    """Get billing summary data by care type (SGBXI, Entleistung, SGBV, Verhinderungspflege, Beratungsbesuche) for stacked bar chart."""
+    """Get billing summary data by care type (SGBXI, Entleistung, SGBV, Verhinderungspflege) grouped by month for stacked bar chart using MongoDB aggregation."""
     try:
-        from app.db.connection import get_db
+        from app.db.connection import get_database
         from datetime import datetime
         
-        with get_db() as conn:
-            c = conn.cursor()
-            # Query care_events grouped by month and event_type to build stacked data
-            c.execute("""
-                SELECT 
-                    ce.period_start_date,
-                    ce.event_type,
-                    COUNT(DISTINCT ce.care_event_id) as record_count,
-                    COALESCE(SUM(ce.sum_total), 0) as total_amount
-                FROM care_events ce
-                GROUP BY ce.period_start_date, ce.event_type
-                ORDER BY ce.period_start_date ASC
-            """)
-            rows = c.fetchall()
+        db = get_database()
+        org_id = "org_default"
+        
+        # Aggregate by both period_start_date and event_type
+        pipeline = [
+            {"$match": {"org_id": org_id}},
+            {
+                "$group": {
+                    "_id": {
+                        "date": "$period_start_date",
+                        "event_type": "$event_type"
+                    },
+                    "total_amount": {"$sum": {"$toDouble": "$sum_total"}},
+                    "record_count": {"$sum": 1}
+                }
+            },
+            {"$sort": {"_id.date": 1}}
+        ]
+        
+        results = list(db.care_events.aggregate(pipeline))
+        
+        # Build monthly data with event types as columns
+        month_data = {}
+        years_present = set()
+        
+        for item in results:
+            date_str = item.get("_id", {}).get("date", "")
+            event_type = item.get("_id", {}).get("event_type", "Unknown")
+            total_amount = item.get("total_amount", 0)
             
-            # Build a nested map: month -> event_type -> amounts
-            month_data = {}
-            year_set = set()
-            
-            for row in rows:
-                date_str, event_type, count, amount = row
-                if date_str:
+            if date_str:
+                try:
+                    # Parse date - handle both DD.MM.YY and DD.MM.YYYY formats
+                    date_str = str(date_str).strip()
                     try:
-                        # Parse DD.MM.YY format
-                        date_str = date_str.strip()
                         dt = datetime.strptime(date_str, "%d.%m.%y")
-                        month_key = dt.strftime("%m%Y")
-                        month_display = dt.strftime("%m/%Y")
-                        year = dt.strftime("%Y")
-                        year_set.add(year)
+                    except ValueError:
+                        dt = datetime.strptime(date_str, "%d.%m.%Y")
+                    
+                    month_key = dt.strftime("%m%Y")
+                    month_display = dt.strftime("%m/%Y")
+                    year = dt.strftime("%Y")
+                    years_present.add(year)
+                    
+                    if month_key not in month_data:
+                        month_data[month_key] = {
+                            "month": month_display,
+                            "year": year,
+                            "SGBXI": 0.0,
+                            "Entleistung": 0.0,
+                            "SGB V": 0.0,
+                            "Verhinderungspflege": 0.0,
+                            "Beratungsbesuche": 0.0,
+                        }
+                    
+                    # Map event types to columns
+                    if event_type == "SGBXI":
+                        month_data[month_key]["SGBXI"] += float(total_amount) if total_amount else 0.0
+                    elif event_type == "Entleistung":
+                        month_data[month_key]["Entleistung"] += float(total_amount) if total_amount else 0.0
+                    elif event_type == "SGBV":  # Note: database has SGBV without space
+                        month_data[month_key]["SGB V"] += float(total_amount) if total_amount else 0.0
+                    elif event_type == "Verhinderungspflege":
+                        month_data[month_key]["Verhinderungspflege"] += float(total_amount) if total_amount else 0.0
+                    elif event_type == "Consultation":  # Consultation = Beratungsbesuche
+                        month_data[month_key]["Beratungsbesuche"] += float(total_amount) if total_amount else 0.0
                         
-                        if month_key not in month_data:
-                            month_data[month_key] = {
-                                "month": month_display,
-                                "SGBXI": 0.0,
-                                "Entleistung": 0.0,
-                                "SGBV": 0.0,
-                                "Verhinderungspflege": 0.0,
-                                "Beratungsbesuche": 0.0,
-                            }
-                        
-                        # Add amount to the corresponding event type
-                        if event_type in month_data[month_key]:
-                            month_data[month_key][event_type] += float(amount) if amount else 0.0
-                        else:
-                            # Handle unknown event types
-                            month_data[month_key][event_type] = float(amount) if amount else 0.0
-                    except (ValueError, TypeError) as pe:
-                        logger.warning(f"Could not parse date: {date_str}, error: {pe}")
-            
-            # Fill in all 12 months for each year present with zero values
-            if year_set:
-                data = []
-                for year in sorted(year_set):
-                    for month_num in range(1, 13):
-                        month_key = f"{month_num:02d}{year}"
+                except (ValueError, TypeError) as pe:
+                    logger.warning(f"Could not parse date: {date_str}, error: {pe}")
+        
+        # Fill in all 12 months for each year present
+        if years_present:
+            for year in sorted(years_present):
+                for month_num in range(1, 13):
+                    month_key = f"{month_num:02d}{year}"
+                    if month_key not in month_data:
                         month_display = f"{month_num:02d}/{year}"
-                        
-                        if month_key in month_data:
-                            data.append(month_data[month_key])
-                        else:
-                            # Add empty month with all zeros
-                            data.append({
-                                "month": month_display,
-                                "SGBXI": 0.0,
-                                "Entleistung": 0.0,
-                                "SGBV": 0.0,
-                                "Verhinderungspflege": 0.0,
-                                "Beratungsbesuche": 0.0,
-                            })
-            else:
-                data = []
-            
-            return {
-                "status": "ok",
-                "data": data
-            }
+                        month_data[month_key] = {
+                            "month": month_display,
+                            "year": year,
+                            "SGBXI": 0.0,
+                            "Entleistung": 0.0,
+                            "SGB V": 0.0,
+                            "Verhinderungspflege": 0.0,
+                            "Beratungsbesuche": 0.0,
+                        }
+        
+        # Convert to sorted list, round values
+        data = sorted(month_data.values(), key=lambda x: x["month"])
+        for row in data:
+            row["SGBXI"] = round(row["SGBXI"], 2)
+            row["Entleistung"] = round(row["Entleistung"], 2)
+            row["SGB V"] = round(row["SGB V"], 2)
+            row["Verhinderungspflege"] = round(row["Verhinderungspflege"], 2)
+            row["Beratungsbesuche"] = round(row["Beratungsbesuche"], 2)
+        
+        # Extract unique years for selection
+        years = sorted(list(years_present))
+        
+        return {
+            "status": "ok",
+            "years": years,
+            "data": data
+        }
     except Exception as e:
         logger.error(f"Billing summary error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _format_date_grouped_analytics(aggregation_results):
+    """
+    Helper function to format MongoDB aggregation results for analytics endpoints.
+    
+    Converts aggregation results with _id (date) to monthly data with month display.
+    
+    Args:
+        aggregation_results: List of dicts from MongoDB aggregation with _id, record_count, total_amount
+        
+    Returns:
+        List of dicts with month display and aggregated data
+    """
+    from datetime import datetime
+    
+    month_data = {}
+    years_present = set()
+    
+    for result in aggregation_results:
+        date_str = result.get("_id", "")
+        record_count = result.get("record_count", 0)
+        total_amount = result.get("total_amount", 0)
+        
+        if date_str:
+            try:
+                # Parse DD.MM.YY format from database
+                date_str = date_str.strip()
+                dt = datetime.strptime(date_str, "%d.%m.%y")
+                month_key = dt.strftime("%m%Y")
+                month_display = dt.strftime("%m/%Y")
+                year = dt.strftime("%Y")
+                years_present.add(year)
+                
+                if month_key not in month_data:
+                    month_data[month_key] = {"month": month_display, "invoice_count": 0, "total_amount": 0.0}
+                
+                month_data[month_key]["invoice_count"] += record_count
+                month_data[month_key]["total_amount"] += float(total_amount) if total_amount else 0.0
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Could not parse date '{date_str}': {e}")
+    
+    # Fill in all 12 months for each year present
+    if years_present:
+        for year in sorted(years_present):
+            for month_num in range(1, 13):
+                month_key = f"{month_num:02d}{year}"
+                if month_key not in month_data:
+                    month_display = f"{month_num:02d}/{year}"
+                    month_data[month_key] = {"month": month_display, "invoice_count": 0, "total_amount": 0.0}
+    
+    # Convert to sorted list
+    return sorted(month_data.values(), key=lambda x: x["month"])
+
+
 @app.get("/analytics/sgbv")
 def get_sgbv_data():
-    """Get SGB V (event_type SGBV) care record data grouped by month from unified schema."""
+    """Get SGB V (event_type SGBV) care record data grouped by month using MongoDB aggregation."""
     try:
-        from app.db.connection import get_db
-        from datetime import datetime
+        from app.db import CareEventRepository
         
-        with get_db() as conn:
-            c = conn.cursor()
-            # Query SGBV care events directly from unified schema
-            c.execute("""
-                SELECT 
-                    ce.period_start_date,
-                    COUNT(DISTINCT ce.care_event_id) as record_count,
-                    SUM(ce.sum_total) as total_amount
-                FROM care_events ce
-                WHERE ce.event_type = 'SGBV'
-                GROUP BY ce.period_start_date
-                ORDER BY ce.period_start_date ASC
-            """)
-            rows = c.fetchall()
-            
-            # Build result data, parsing DD.MM.YY format and grouping by month
-            month_data = {}
-            years_present = set()
-            
-            for row in rows:
-                date_str, count, amount = row
-                if date_str:
-                    try:
-                        # Parse DD.MM.YY format from database, strip whitespace
-                        date_str = date_str.strip()
-                        dt = datetime.strptime(date_str, "%d.%m.%y")
-                        month_key = dt.strftime("%m%Y")
-                        month_display = dt.strftime("%m/%Y")
-                        year = dt.strftime("%Y")
-                        years_present.add(year)
-                        
-                        if month_key not in month_data:
-                            month_data[month_key] = {"month": month_display, "invoice_count": 0, "total_amount": 0.0}
-                        
-                        month_data[month_key]["invoice_count"] += count or 0
-                        month_data[month_key]["total_amount"] += float(amount) if amount else 0.0
-                    except (ValueError, TypeError) as pe:
-                        logger.warning(f"Could not parse date: {date_str}, error: {pe}")
-            
-            # Fill in all 12 months for each year present
-            if years_present:
-                for year in sorted(years_present):
-                    for month_num in range(1, 13):
-                        month_key = f"{month_num:02d}{year}"
-                        if month_key not in month_data:
-                            month_display = f"{month_num:02d}/{year}"
-                            month_data[month_key] = {"month": month_display, "invoice_count": 0, "total_amount": 0.0}
-            
-            # Convert to sorted list
-            data = sorted(month_data.values(), key=lambda x: x["month"])
-            
-            return {
-                "status": "ok",
-                "data": data
-            }
+        # Use MongoDB aggregation instead of SQL
+        results = CareEventRepository.get_summary_by_event_type("SGBV")
+        
+        # Format results for API response
+        data = _format_date_grouped_analytics(results)
+        
+        return {
+            "status": "ok",
+            "data": data
+        }
     except Exception as e:
         logger.error(f"SGB V data error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -894,66 +959,20 @@ def get_sgbv_data():
 
 @app.get("/analytics/verhinderungspflege")
 def get_verhinderungspflege_data():
-    """Get VerhinderungsPflege (event_type Verhinderungspflege) care record data grouped by month from unified schema."""
+    """Get VerhinderungsPflege (event_type Verhinderungspflege) care record data grouped by month using MongoDB aggregation."""
     try:
-        from app.db.connection import get_db
-        from datetime import datetime
+        from app.db import CareEventRepository
         
-        with get_db() as conn:
-            c = conn.cursor()
-            # Query Verhinderungspflege from unified schema
-            c.execute("""
-                SELECT 
-                    ce.period_start_date,
-                    COUNT(DISTINCT ce.care_event_id) as record_count,
-                    SUM(ce.sum_total) as total_amount
-                FROM care_events ce
-                WHERE ce.event_type = 'Verhinderungspflege'
-                GROUP BY ce.period_start_date
-                ORDER BY ce.period_start_date ASC
-            """)
-            rows = c.fetchall()
-            
-            # Build result data, parsing DD.MM.YY format and grouping by month
-            month_data = {}
-            years_present = set()
-            
-            for row in rows:
-                date_str, count, amount = row
-                if date_str:
-                    try:
-                        # Parse DD.MM.YY format from database, strip whitespace
-                        date_str = date_str.strip()
-                        dt = datetime.strptime(date_str, "%d.%m.%y")
-                        month_key = dt.strftime("%m%Y")
-                        month_display = dt.strftime("%m/%Y")
-                        year = dt.strftime("%Y")
-                        years_present.add(year)
-                        
-                        if month_key not in month_data:
-                            month_data[month_key] = {"month": month_display, "invoice_count": 0, "total_amount": 0.0}
-                        
-                        month_data[month_key]["invoice_count"] += count or 0
-                        month_data[month_key]["total_amount"] += float(amount) if amount else 0.0
-                    except (ValueError, TypeError) as pe:
-                        logger.warning(f"Could not parse date: {date_str}, error: {pe}")
-            
-            # Fill in all 12 months for each year present
-            if years_present:
-                for year in sorted(years_present):
-                    for month_num in range(1, 13):
-                        month_key = f"{month_num:02d}{year}"
-                        if month_key not in month_data:
-                            month_display = f"{month_num:02d}/{year}"
-                            month_data[month_key] = {"month": month_display, "invoice_count": 0, "total_amount": 0.0}
-            
-            # Convert to sorted list
-            data = sorted(month_data.values(), key=lambda x: x["month"])
-            
-            return {
-                "status": "ok",
-                "data": data
-            }
+        # Use MongoDB aggregation instead of SQL
+        results = CareEventRepository.get_summary_by_event_type("Verhinderungspflege")
+        
+        # Format results for API response
+        data = _format_date_grouped_analytics(results)
+        
+        return {
+            "status": "ok",
+            "data": data
+        }
     except Exception as e:
         logger.error(f"VerhinderungsPflege data error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -961,66 +980,24 @@ def get_verhinderungspflege_data():
 
 @app.get("/analytics/sgbxi")
 def get_sgbxi_data():
-    """Get SGB XI & Entlastungsleistungen data grouped by period_start_date month from unified schema."""
+    """Get SGB XI & Entlastungsleistungen data grouped by month using MongoDB aggregation."""
     try:
-        from app.db.connection import get_db
-        from datetime import datetime
+        from app.db import CareEventRepository
         
-        with get_db() as conn:
-            c = conn.cursor()
-            # Query care events for SGBXI and Entleistung from unified schema
-            c.execute("""
-                SELECT 
-                    ce.period_start_date,
-                    COUNT(DISTINCT ce.care_event_id) as invoice_count,
-                    COALESCE(SUM(ce.sum_total), 0) as total_amount
-                FROM care_events ce
-                WHERE ce.event_type IN ('SGBXI', 'Entleistung')
-                GROUP BY ce.period_start_date
-                ORDER BY ce.period_start_date ASC
-            """)
-            rows = c.fetchall()
-            
-            # Build result data, parsing DD.MM.YY format and grouping by month
-            month_data = {}
-            years_present = set()
-            
-            for row in rows:
-                date_str, count, amount = row
-                if date_str:
-                    try:
-                        # Parse DD.MM.YY format from database, strip whitespace
-                        date_str = date_str.strip()
-                        dt = datetime.strptime(date_str, "%d.%m.%y")
-                        month_key = dt.strftime("%m%Y")
-                        month_display = dt.strftime("%m/%Y")
-                        year = dt.strftime("%Y")
-                        years_present.add(year)
-                        
-                        if month_key not in month_data:
-                            month_data[month_key] = {"month": month_display, "invoice_count": 0, "total_amount": 0.0}
-                        
-                        month_data[month_key]["invoice_count"] += count or 0
-                        month_data[month_key]["total_amount"] += float(amount) if amount else 0.0
-                    except (ValueError, TypeError) as pe:
-                        logger.warning(f"Could not parse date: {date_str}, error: {pe}")
-            
-            # Fill in all 12 months for each year present
-            if years_present:
-                for year in sorted(years_present):
-                    for month_num in range(1, 13):
-                        month_key = f"{month_num:02d}{year}"
-                        if month_key not in month_data:
-                            month_display = f"{month_num:02d}/{year}"
-                            month_data[month_key] = {"month": month_display, "invoice_count": 0, "total_amount": 0.0}
-            
-            # Convert to sorted list
-            data = sorted(month_data.values(), key=lambda x: x["month"])
-            
-            return {
-                "status": "ok",
-                "data": data
-            }
+        # Query both SGBXI and Entleistung
+        sgbxi_results = CareEventRepository.get_summary_by_event_type("SGBXI")
+        entleistung_results = CareEventRepository.get_summary_by_event_type("Entleistung")
+        
+        # Combine results
+        combined_results = sgbxi_results + entleistung_results
+        
+        # Format results for API response
+        data = _format_date_grouped_analytics(combined_results)
+        
+        return {
+            "status": "ok",
+            "data": data
+        }
     except Exception as e:
         logger.error(f"SGB XI data error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1028,63 +1005,90 @@ def get_sgbxi_data():
 
 @app.get("/analytics/sgbv/patient/{patient_id}")
 def get_sgbv_by_patient(patient_id: str):
-    """Get SGB V care records for a specific patient grouped by month from unified schema."""
+    """Get SGB V care records for a specific patient grouped by month from MongoDB."""
     try:
-        from app.db.connection import get_db
+        from app.db.connection import get_database
         from datetime import datetime
         
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT 
-                    ce.period_start_date,
-                    SUM(ce.sum_total) as total_amount
-                FROM care_events ce
-                WHERE ce.event_type = 'SGBV' AND ce.patient_id = ?
-                GROUP BY ce.period_start_date
-                ORDER BY ce.period_start_date ASC
-            """, (patient_id,))
-            rows = c.fetchall()
+        db = get_database()
+        org_id = "org_default"
+        
+        # Try both string and integer formats to handle mixed ID types in DB
+        patient_id_int = None
+        try:
+            patient_id_int = int(patient_id)
+        except (ValueError, TypeError):
+            pass
+        
+        # Query with both possible ID formats
+        # NOTE: Database stores "SGBV" but we display as "SGB V"
+        query = {"org_id": org_id, "event_type": "SGBV"}
+        if patient_id_int is not None:
+            query["patient_id"] = {"$in": [patient_id, patient_id_int]}
+        else:
+            query["patient_id"] = patient_id
+        
+        # Get records grouped by period_start_date
+        pipeline = [
+            {"$match": query},
+            {
+                "$group": {
+                    "_id": "$period_start_date",
+                    "total_amount": {"$sum": {"$toDouble": "$sum_total"}}
+                }
+            },
+            {"$sort": {"_id": 1}}
+        ]
+        
+        rows = list(db.care_events.aggregate(pipeline))
+        
+        # Build result data, parsing date format and grouping by month
+        month_data = {}
+        years_present = set()
+        
+        for row in rows:
+            date_str = row.get("_id")
+            amount = row.get("total_amount", 0)
             
-            # Build result data, parsing DD.MM.YY format and grouping by month
-            month_data = {}
-            years_present = set()
-            
-            for row in rows:
-                date_str, amount = row
-                if date_str:
+            if date_str:
+                try:
+                    # Handle various date formats
+                    date_str = str(date_str).strip()
+                    # Try DD.MM.YY format first
                     try:
-                        # Parse DD.MM.YY format from database, strip whitespace
-                        date_str = date_str.strip()
                         dt = datetime.strptime(date_str, "%d.%m.%y")
-                        month_key = dt.strftime("%m%Y")
-                        month_display = dt.strftime("%m/%Y")
-                        year = dt.strftime("%Y")
-                        years_present.add(year)
-                        
-                        if month_key not in month_data:
-                            month_data[month_key] = {"month": month_display, "total_amount": 0.0}
-                        
-                        month_data[month_key]["total_amount"] += float(amount) if amount else 0.0
-                    except (ValueError, TypeError) as pe:
-                        logger.warning(f"Could not parse date: {date_str}, error: {pe}")
-            
-            # Fill in all 12 months for each year present
-            if years_present:
-                for year in sorted(years_present):
-                    for month_num in range(1, 13):
-                        month_key = f"{month_num:02d}{year}"
-                        if month_key not in month_data:
-                            month_display = f"{month_num:02d}/{year}"
-                            month_data[month_key] = {"month": month_display, "total_amount": 0.0}
-            
-            # Convert to sorted list
-            data = sorted(month_data.values(), key=lambda x: x["month"])
-            
-            return {
-                "status": "ok",
-                "data": data
-            }
+                    except ValueError:
+                        # Try DD.MM.YYYY format
+                        dt = datetime.strptime(date_str, "%d.%m.%Y")
+                    
+                    month_key = dt.strftime("%m%Y")
+                    month_display = dt.strftime("%m/%Y")
+                    year = dt.strftime("%Y")
+                    years_present.add(year)
+                    
+                    if month_key not in month_data:
+                        month_data[month_key] = {"month": month_display, "total_amount": 0.0}
+                    
+                    month_data[month_key]["total_amount"] += float(amount) if amount else 0.0
+                except (ValueError, TypeError) as pe:
+                    logger.warning(f"Could not parse date: {date_str}, error: {pe}")
+        
+        # Fill in all 12 months for each year present
+        if years_present:
+            for year in sorted(years_present):
+                for month_num in range(1, 13):
+                    month_key = f"{month_num:02d}{year}"
+                    if month_key not in month_data:
+                        month_display = f"{month_num:02d}/{year}"
+                        month_data[month_key] = {"month": month_display, "total_amount": 0.0}
+        
+        # Convert to sorted list
+        data = sorted(month_data.values(), key=lambda x: x["month"])
+        
+        return {
+            "status": "ok",
+            "data": data
+        }
     except Exception as e:
         logger.error(f"SGB V patient data error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1092,63 +1096,89 @@ def get_sgbv_by_patient(patient_id: str):
 
 @app.get("/analytics/verhinderungspflege/patient/{patient_id}")
 def get_verhinderungspflege_by_patient(patient_id: str):
-    """Get Verhinderungspflege care records for a specific patient grouped by month from unified schema."""
+    """Get Verhinderungspflege care records for a specific patient grouped by month from MongoDB."""
     try:
-        from app.db.connection import get_db
+        from app.db.connection import get_database
         from datetime import datetime
         
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT 
-                    ce.period_start_date,
-                    SUM(ce.sum_total) as total_amount
-                FROM care_events ce
-                WHERE ce.event_type = 'Verhinderungspflege' AND ce.patient_id = ?
-                GROUP BY ce.period_start_date
-                ORDER BY ce.period_start_date ASC
-            """, (patient_id,))
-            rows = c.fetchall()
+        db = get_database()
+        org_id = "org_default"
+        
+        # Try both string and integer formats to handle mixed ID types in DB
+        patient_id_int = None
+        try:
+            patient_id_int = int(patient_id)
+        except (ValueError, TypeError):
+            pass
+        
+        # Query with both possible ID formats
+        query = {"org_id": org_id, "event_type": "Verhinderungspflege"}
+        if patient_id_int is not None:
+            query["patient_id"] = {"$in": [patient_id, patient_id_int]}
+        else:
+            query["patient_id"] = patient_id
+        
+        # Get records grouped by period_start_date
+        pipeline = [
+            {"$match": query},
+            {
+                "$group": {
+                    "_id": "$period_start_date",
+                    "total_amount": {"$sum": {"$toDouble": "$sum_total"}}
+                }
+            },
+            {"$sort": {"_id": 1}}
+        ]
+        
+        rows = list(db.care_events.aggregate(pipeline))
+        
+        # Build result data, parsing date format and grouping by month
+        month_data = {}
+        years_present = set()
+        
+        for row in rows:
+            date_str = row.get("_id")
+            amount = row.get("total_amount", 0)
             
-            # Build result data, parsing DD.MM.YY format and grouping by month
-            month_data = {}
-            years_present = set()
-            
-            for row in rows:
-                date_str, amount = row
-                if date_str:
+            if date_str:
+                try:
+                    # Handle various date formats
+                    date_str = str(date_str).strip()
+                    # Try DD.MM.YY format first
                     try:
-                        # Parse DD.MM.YY format from database, strip whitespace
-                        date_str = date_str.strip()
                         dt = datetime.strptime(date_str, "%d.%m.%y")
-                        month_key = dt.strftime("%m%Y")
-                        month_display = dt.strftime("%m/%Y")
-                        year = dt.strftime("%Y")
-                        years_present.add(year)
-                        
-                        if month_key not in month_data:
-                            month_data[month_key] = {"month": month_display, "total_amount": 0.0}
-                        
-                        month_data[month_key]["total_amount"] += float(amount) if amount else 0.0
-                    except (ValueError, TypeError) as pe:
-                        logger.warning(f"Could not parse date: {date_str}, error: {pe}")
-            
-            # Fill in all 12 months for each year present
-            if years_present:
-                for year in sorted(years_present):
-                    for month_num in range(1, 13):
-                        month_key = f"{month_num:02d}{year}"
-                        if month_key not in month_data:
-                            month_display = f"{month_num:02d}/{year}"
-                            month_data[month_key] = {"month": month_display, "total_amount": 0.0}
-            
-            # Convert to sorted list
-            data = sorted(month_data.values(), key=lambda x: x["month"])
-            
-            return {
-                "status": "ok",
-                "data": data
-            }
+                    except ValueError:
+                        # Try DD.MM.YYYY format
+                        dt = datetime.strptime(date_str, "%d.%m.%Y")
+                    
+                    month_key = dt.strftime("%m%Y")
+                    month_display = dt.strftime("%m/%Y")
+                    year = dt.strftime("%Y")
+                    years_present.add(year)
+                    
+                    if month_key not in month_data:
+                        month_data[month_key] = {"month": month_display, "total_amount": 0.0}
+                    
+                    month_data[month_key]["total_amount"] += float(amount) if amount else 0.0
+                except (ValueError, TypeError) as pe:
+                    logger.warning(f"Could not parse date: {date_str}, error: {pe}")
+        
+        # Fill in all 12 months for each year present
+        if years_present:
+            for year in sorted(years_present):
+                for month_num in range(1, 13):
+                    month_key = f"{month_num:02d}{year}"
+                    if month_key not in month_data:
+                        month_display = f"{month_num:02d}/{year}"
+                        month_data[month_key] = {"month": month_display, "total_amount": 0.0}
+        
+        # Convert to sorted list
+        data = sorted(month_data.values(), key=lambda x: x["month"])
+        
+        return {
+            "status": "ok",
+            "data": data
+        }
     except Exception as e:
         logger.error(f"Verhinderungspflege patient data error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1161,44 +1191,63 @@ def get_verhinderungspflege_by_patient(patient_id: str):
 def get_private_invoices():
     """Get all billable invoices (SGBXI + Entleistung), excluding Consultations."""
     try:
-        from app.db.connection import get_db
+        from app.db.mongodb_config import get_database
         
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT 
-                    ce.care_event_id,
-                    pp.patient_name,
-                    ce.period_start_date,
-                    ce.period_end_date,
-                    bd.billing_status,
-                    bd.amount_owed,
-                    bd.sum_total
-                FROM care_events ce
-                JOIN patient_profiles pp ON ce.patient_id = pp.patient_id
-                LEFT JOIN billing_details bd ON ce.care_event_id = bd.care_event_id
-                WHERE ce.event_type IN ('SGBXI', 'Entleistung')
-                ORDER BY ce.created_at DESC
-            """)
-            rows = c.fetchall()
-            
-            invoices = []
-            for row in rows:
-                care_event_id, patient_name, period_start, period_end, status, amount_owed, sum_total = row
-                invoices.append({
-                    "care_event_id": care_event_id,
-                    "patient_name": patient_name,
-                    "period_start_date": period_start,
-                    "period_end_date": period_end,
-                    "billing_status": status or "pending",
-                    "amount_owed": float(amount_owed) if amount_owed else 0.0,
-                    "sum_total": float(sum_total) if sum_total else 0.0,
-                })
-            
-            return {
-                "status": "ok",
-                "invoices": invoices
-            }
+        db = get_database()
+        
+        # MongoDB aggregation pipeline
+        pipeline = [
+            {
+                "$match": {
+                    "org_id": "org_default",
+                    "event_type": {"$in": ["SGBXI", "Entleistung"]}
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "patient_profiles",
+                    "let": {"patient_id": "$patient_id"},
+                    "pipeline": [
+                        {"$match": {"$expr": {"$eq": ["$patient_id", "$$patient_id"]}}}
+                    ],
+                    "as": "patient"
+                }
+            },
+            {"$unwind": {"path": "$patient", "preserveNullAndEmptyArrays": True}},
+            {
+                "$lookup": {
+                    "from": "billing_details",
+                    "let": {"care_event_id": "$care_event_id"},
+                    "pipeline": [
+                        {"$match": {"$expr": {"$eq": ["$care_event_id", "$$care_event_id"]}}}
+                    ],
+                    "as": "billing"
+                }
+            },
+            {"$unwind": {"path": "$billing", "preserveNullAndEmptyArrays": True}},
+            {"$sort": {"created_at": -1}}
+        ]
+        
+        results = list(db.care_events.aggregate(pipeline))
+        
+        invoices = []
+        for doc in results:
+            billing = doc.get("billing") or {}
+            patient = doc.get("patient") or {}
+            invoices.append({
+                "care_event_id": doc.get("care_event_id"),
+                "patient_name": patient.get("patient_name", ""),
+                "period_start_date": doc.get("period_start_date"),
+                "period_end_date": doc.get("period_end_date"),
+                "billing_status": billing.get("billing_status", "pending"),
+                "amount_owed": float(billing.get("amount_owed", 0) or 0),
+                "sum_total": float(doc.get("sum_total", 0) or 0),
+            })
+        
+        return {
+            "status": "ok",
+            "invoices": invoices
+        }
     except Exception as e:
         logger.error(f"Private invoices error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1206,63 +1255,20 @@ def get_private_invoices():
 
 @app.get("/analytics/consultations")
 def get_consultations_data():
-    """Get Consultations (event_type Consultation) grouped by month from unified schema."""
+    """Get Consultations (event_type Consultation) grouped by month using MongoDB aggregation."""
     try:
-        from app.db.connection import get_db
-        from datetime import datetime
+        from app.db import CareEventRepository
         
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT 
-                    ce.period_start_date,
-                    COUNT(*) as consultation_count,
-                    SUM(ce.sum_total) as total_amount
-                FROM care_events ce
-                WHERE ce.event_type = 'Consultation'
-                GROUP BY ce.period_start_date
-                ORDER BY ce.period_start_date ASC
-            """)
-            rows = c.fetchall()
-            
-            month_data = {}
-            years_present = set()
-            
-            for row in rows:
-                date_str, count, amount = row
-                if date_str:
-                    try:
-                        # Parse DD.MM.YY format from database, strip whitespace
-                        date_str = date_str.strip()
-                        dt = datetime.strptime(date_str, "%d.%m.%y")
-                        month_key = dt.strftime("%m%Y")
-                        month_display = dt.strftime("%m/%Y")
-                        year = dt.strftime("%Y")
-                        years_present.add(year)
-                        
-                        if month_key not in month_data:
-                            month_data[month_key] = {"month": month_display, "invoice_count": 0, "total_amount": 0.0}
-                        
-                        month_data[month_key]["invoice_count"] += count or 0
-                        month_data[month_key]["total_amount"] += float(amount) if amount else 0.0
-                    except (ValueError, TypeError) as pe:
-                        logger.warning(f"Could not parse date: {date_str}, error: {pe}")
-            
-            # Fill in all 12 months for each year present
-            if years_present:
-                for year in sorted(years_present):
-                    for month_num in range(1, 13):
-                        month_key = f"{month_num:02d}{year}"
-                        if month_key not in month_data:
-                            month_display = f"{month_num:02d}/{year}"
-                            month_data[month_key] = {"month": month_display, "invoice_count": 0, "total_amount": 0.0}
-            
-            data = sorted(month_data.values(), key=lambda x: x["month"])
-            
-            return {
-                "status": "ok",
-                "data": data
-            }
+        # Use MongoDB aggregation instead of SQL
+        results = CareEventRepository.get_summary_by_event_type("Consultation")
+        
+        # Format results for API response
+        data = _format_date_grouped_analytics(results)
+        
+        return {
+            "status": "ok",
+            "data": data
+        }
     except Exception as e:
         logger.error(f"Consultations data error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1270,61 +1276,87 @@ def get_consultations_data():
 
 @app.get("/analytics/consultations/patient/{patient_id}")
 def get_consultations_by_patient(patient_id: str):
-    """Get Consultations for a specific patient grouped by month from unified schema."""
+    """Get Consultations for a specific patient grouped by month from MongoDB."""
     try:
-        from app.db.connection import get_db
+        from app.db.connection import get_database
         from datetime import datetime
         
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("""
-                SELECT 
-                    ce.period_start_date,
-                    SUM(ce.sum_total) as total_amount
-                FROM care_events ce
-                WHERE ce.event_type = 'Consultation' AND ce.patient_id = ?
-                GROUP BY ce.period_start_date
-                ORDER BY ce.period_start_date ASC
-            """, (patient_id,))
-            rows = c.fetchall()
+        db = get_database()
+        org_id = "org_default"
+        
+        # Try both string and integer formats to handle mixed ID types in DB
+        patient_id_int = None
+        try:
+            patient_id_int = int(patient_id)
+        except (ValueError, TypeError):
+            pass
+        
+        # Query with both possible ID formats
+        query = {"org_id": org_id, "event_type": "Consultation"}
+        if patient_id_int is not None:
+            query["patient_id"] = {"$in": [patient_id, patient_id_int]}
+        else:
+            query["patient_id"] = patient_id
+        
+        # Get records grouped by period_start_date
+        pipeline = [
+            {"$match": query},
+            {
+                "$group": {
+                    "_id": "$period_start_date",
+                    "total_amount": {"$sum": {"$toDouble": "$sum_total"}}
+                }
+            },
+            {"$sort": {"_id": 1}}
+        ]
+        
+        rows = list(db.care_events.aggregate(pipeline))
+        
+        month_data = {}
+        years_present = set()
+        
+        for row in rows:
+            date_str = row.get("_id")
+            amount = row.get("total_amount", 0)
             
-            month_data = {}
-            years_present = set()
-            
-            for row in rows:
-                date_str, amount = row
-                if date_str:
+            if date_str:
+                try:
+                    # Handle various date formats
+                    date_str = str(date_str).strip()
+                    # Try DD.MM.YY format first
                     try:
-                        # Parse DD.MM.YY format from database, strip whitespace
-                        date_str = date_str.strip()
                         dt = datetime.strptime(date_str, "%d.%m.%y")
-                        month_key = dt.strftime("%m%Y")
-                        month_display = dt.strftime("%m/%Y")
-                        year = dt.strftime("%Y")
-                        years_present.add(year)
-                        
-                        if month_key not in month_data:
-                            month_data[month_key] = {"month": month_display, "total_amount": 0.0}
-                        
-                        month_data[month_key]["total_amount"] += float(amount) if amount else 0.0
-                    except (ValueError, TypeError) as pe:
-                        logger.warning(f"Could not parse date: {date_str}, error: {pe}")
-            
-            # Fill in all 12 months for each year present
-            if years_present:
-                for year in sorted(years_present):
-                    for month_num in range(1, 13):
-                        month_key = f"{month_num:02d}{year}"
-                        if month_key not in month_data:
-                            month_display = f"{month_num:02d}/{year}"
-                            month_data[month_key] = {"month": month_display, "total_amount": 0.0}
-            
-            data = sorted(month_data.values(), key=lambda x: x["month"])
-            
-            return {
-                "status": "ok",
-                "data": data
-            }
+                    except ValueError:
+                        # Try DD.MM.YYYY format
+                        dt = datetime.strptime(date_str, "%d.%m.%Y")
+                    
+                    month_key = dt.strftime("%m%Y")
+                    month_display = dt.strftime("%m/%Y")
+                    year = dt.strftime("%Y")
+                    years_present.add(year)
+                    
+                    if month_key not in month_data:
+                        month_data[month_key] = {"month": month_display, "total_amount": 0.0}
+                    
+                    month_data[month_key]["total_amount"] += float(amount) if amount else 0.0
+                except (ValueError, TypeError) as pe:
+                    logger.warning(f"Could not parse date: {date_str}, error: {pe}")
+        
+        # Fill in all 12 months for each year present
+        if years_present:
+            for year in sorted(years_present):
+                for month_num in range(1, 13):
+                    month_key = f"{month_num:02d}{year}"
+                    if month_key not in month_data:
+                        month_display = f"{month_num:02d}/{year}"
+                        month_data[month_key] = {"month": month_display, "total_amount": 0.0}
+        
+        data = sorted(month_data.values(), key=lambda x: x["month"])
+        
+        return {
+            "status": "ok",
+            "data": data
+        }
     except Exception as e:
         logger.error(f"Consultations patient data error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1336,4 +1368,443 @@ def get_consultations_by_patient(patient_id: str):
 @app.get("/")
 def root():
     return {"message": "Pflegedienst Jung API is running"}
+
+
+# ------------------------------
+# Billing Management (Rechnungsverwaltung)
+# ------------------------------
+
+@app.get("/billing/patients")
+def get_billing_patients():
+    """Get list of patients with billing details."""
+    try:
+        from app.db.connection import get_database
+        db = get_database()
+        org_id = "org_default"
+        
+        # Get all patient_ids with any billing details
+        all_care_event_ids = db.billing_details.distinct(
+            "care_event_id", 
+            {"org_id": org_id}
+        )
+        
+        # Get patient_ids from those care_events
+        patient_ids = db.care_events.distinct(
+            "patient_id",
+            {"org_id": org_id, "care_event_id": {"$in": all_care_event_ids}}
+        )
+        
+        # Get patient info with billing counts
+        patients = []
+        for pid in patient_ids:
+            patient = db.patient_profiles.find_one({"patient_id": pid})
+            if patient:
+                # Count all billing details for this patient
+                patient_care_events = db.care_events.distinct(
+                    "care_event_id",
+                    {"org_id": org_id, "patient_id": pid}
+                )
+                billing_count = db.billing_details.count_documents({
+                    "org_id": org_id,
+                    "care_event_id": {"$in": patient_care_events}
+                })
+                patients.append({
+                    "id": pid,
+                    "name": patient.get("patient_name", "Unknown"),
+                    "pending_count": billing_count
+                })
+        
+        # Sort by name
+        patients.sort(key=lambda x: x["name"])
+        
+        return {"status": "ok", "patients": patients}
+    except Exception as e:
+        logger.error(f"Billing patients error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/billing/patient/{patient_id}/pending")
+def get_patient_pending_billing(patient_id: str):
+    """Get all billing details for a patient."""
+    try:
+        from app.db.connection import get_database
+        db = get_database()
+        org_id = "org_default"
+        
+        # Get care_events for this patient
+        care_events = list(db.care_events.find(
+            {"org_id": org_id, "patient_id": patient_id}
+        ))
+        care_event_map = {ce["care_event_id"]: ce for ce in care_events}
+        care_event_ids = list(care_event_map.keys())
+        
+        # Get ALL billing_details for these care_events (no status filter)
+        billing_details = list(db.billing_details.find({
+            "org_id": org_id,
+            "care_event_id": {"$in": care_event_ids}
+        }))
+        
+        # Enrich with care_event info
+        result = []
+        for bd in billing_details:
+            ce = care_event_map.get(bd["care_event_id"], {})
+            result.append({
+                "billing_detail_id": bd.get("billing_detail_id"),
+                "care_event_id": bd.get("care_event_id"),
+                "invoicing_month": bd.get("invoicing_month"),
+                "sum_covered": bd.get("sum_covered", 0),
+                "sum_total": bd.get("sum_total", 0),
+                "amount_owed": bd.get("amount_owed", 0),
+                "billing_status": bd.get("billing_status"),
+                "invoice_number": bd.get("invoice_number"),
+                "event_type": ce.get("event_type", ""),
+                "period_start_date": ce.get("period_start_date", ""),
+                "period_end_date": ce.get("period_end_date", ""),
+                "care_account": ce.get("care_account", ""),
+                "services_count": len(ce.get("services", []))
+            })
+        
+        # Sort by period_start_date (latest first)
+        def parse_german_date(date_str):
+            """Parse DD.MM.YY to sortable tuple (year, month, day)"""
+            if not date_str:
+                return (0, 0, 0)
+            try:
+                parts = date_str.split(".")
+                if len(parts) == 3:
+                    day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+                    # Convert 2-digit year to 4-digit
+                    year = year + 2000 if year < 50 else year + 1900
+                    return (year, month, day)
+            except:
+                pass
+            return (0, 0, 0)
+        
+        result.sort(key=lambda x: parse_german_date(x.get("period_start_date", "")), reverse=True)
+        
+        return {"status": "ok", "billing_details": result}
+    except Exception as e:
+        logger.error(f"Patient pending billing error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/billing/detail/{billing_detail_id}/services")
+def get_billing_detail_services(billing_detail_id: str):
+    """Get services for a specific billing detail."""
+    try:
+        from app.db.connection import get_database
+        db = get_database()
+        org_id = "org_default"
+        
+        # Get billing_detail
+        bd = db.billing_details.find_one({
+            "org_id": org_id,
+            "billing_detail_id": billing_detail_id
+        })
+        if not bd:
+            raise HTTPException(status_code=404, detail="Billing detail not found")
+        
+        # Get linked care_event
+        ce = db.care_events.find_one({
+            "org_id": org_id,
+            "care_event_id": bd["care_event_id"]
+        })
+        if not ce:
+            raise HTTPException(status_code=404, detail="Care event not found")
+        
+        services = ce.get("services", [])
+        
+        return {
+            "status": "ok",
+            "billing_detail_id": billing_detail_id,
+            "care_event_id": bd["care_event_id"],
+            "services": services,
+            "sum_covered": bd.get("sum_covered", 0),
+            "sum_total": bd.get("sum_total", 0)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get services error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ServiceUpdate(BaseModel):
+    service_code: str
+    service_description: str
+    quantity_value: float
+    unit_price: float
+    line_total: Optional[float] = None
+
+
+class ServicesUpdateRequest(BaseModel):
+    services: List[ServiceUpdate]
+    sum_covered: Optional[float] = None
+
+
+@app.put("/billing/detail/{billing_detail_id}/services")
+def update_billing_detail_services(billing_detail_id: str, request: ServicesUpdateRequest):
+    """Update services for a billing detail (edit/delete services)."""
+    try:
+        from app.db.connection import get_database
+        db = get_database()
+        org_id = "org_default"
+        
+        # Get billing_detail
+        bd = db.billing_details.find_one({
+            "org_id": org_id,
+            "billing_detail_id": billing_detail_id
+        })
+        if not bd:
+            raise HTTPException(status_code=404, detail="Billing detail not found")
+        
+        # Build updated services with recalculated line_totals
+        updated_services = []
+        new_sum_total = 0
+        for svc in request.services:
+            line_total = svc.quantity_value * svc.unit_price
+            updated_services.append({
+                "service_code": svc.service_code,
+                "service_description": svc.service_description,
+                "quantity_value": svc.quantity_value,
+                "unit_price": svc.unit_price,
+                "line_total": round(line_total, 2),
+                "updated_at": datetime.now().isoformat()
+            })
+            new_sum_total += line_total
+        
+        new_sum_total = round(new_sum_total, 2)
+        new_sum_covered = request.sum_covered if request.sum_covered is not None else new_sum_total
+        
+        # Update care_event services and totals
+        db.care_events.update_one(
+            {"org_id": org_id, "care_event_id": bd["care_event_id"]},
+            {
+                "$set": {
+                    "services": updated_services,
+                    "sum_total": new_sum_total,
+                    "sum_covered": new_sum_covered,
+                    "updated_at": datetime.now().isoformat()
+                }
+            }
+        )
+        
+        # Update billing_detail totals
+        db.billing_details.update_one(
+            {"org_id": org_id, "billing_detail_id": billing_detail_id},
+            {
+                "$set": {
+                    "sum_total": new_sum_total,
+                    "sum_covered": new_sum_covered,
+                    "updated_at": datetime.now().isoformat()
+                }
+            }
+        )
+        
+        return {
+            "status": "ok",
+            "message": "Services updated successfully",
+            "sum_total": new_sum_total,
+            "sum_covered": new_sum_covered,
+            "services_count": len(updated_services)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Update services error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/billing/detail/{billing_detail_id}/regenerate-pdf")
+def regenerate_billing_pdf(billing_detail_id: str):
+    """Regenerate invoice PDF for a billing detail."""
+    try:
+        from app.db.connection import get_database
+        from app.db.mongodb_repositories import InvoiceRepository
+        import subprocess
+        
+        db = get_database()
+        org_id = "org_default"
+        
+        # Get billing_detail
+        bd = db.billing_details.find_one({
+            "org_id": org_id,
+            "billing_detail_id": billing_detail_id
+        })
+        if not bd:
+            raise HTTPException(status_code=404, detail="Billing detail not found")
+        
+        # Get linked care_event
+        ce = db.care_events.find_one({
+            "org_id": org_id,
+            "care_event_id": bd["care_event_id"]
+        })
+        if not ce:
+            raise HTTPException(status_code=404, detail="Care event not found")
+        
+        # Get patient info
+        patient_doc = db.patient_profiles.find_one({
+            "patient_id": ce["patient_id"]
+        })
+        if not patient_doc:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        
+        event_type = ce.get("event_type", "")
+        
+        # Assign invoice number if not present
+        invoice_number = bd.get("invoice_number")
+        if not invoice_number:
+            invoice_number = InvoiceRepository.get_next_invoice_number()
+            # Update billing_detail with invoice number
+            db.billing_details.update_one(
+                {"org_id": org_id, "billing_detail_id": billing_detail_id},
+                {"$set": {"invoice_number": invoice_number, "updated_at": datetime.now().isoformat()}}
+            )
+        
+        # Build address from split fields
+        street_name = patient_doc.get("street_name", "") or ""
+        street_number = patient_doc.get("street_number", "") or ""
+        postal_code = patient_doc.get("postal_code", "") or ""
+        city = patient_doc.get("city", "") or ""
+        address = f"{street_name} {street_number} {postal_code} {city}".strip()
+        
+        # Map services from MongoDB format to template format
+        mongo_services = ce.get("services", [])
+        mapped_services = [
+            {
+                "id": idx,
+                "code": svc.get("service_code", ""),
+                "description": svc.get("service_description", ""),
+                "quantity": svc.get("quantity_value", 0),
+                "unit_price": svc.get("unit_price", 0),
+                "total_price": svc.get("line_total", 0)
+            }
+            for idx, svc in enumerate(mongo_services)
+        ]
+        
+        # Build data dict matching what generate_invoice_pdf expects
+        data = {
+            "patient": {
+                "id": patient_doc.get("patient_id"),
+                "name": patient_doc.get("patient_name", ""),
+                "birthdate": patient_doc.get("date_of_birth", ""),
+                "insurance_number": patient_doc.get("insurance_number", ""),
+                "care_level": patient_doc.get("care_level", ""),
+                "include_service_packet": patient_doc.get("include_service_packet", 0) if event_type == "SGBXI" else 0,
+                "address": address,
+                "debtor_number": patient_doc.get("debtor_id", "") or patient_doc.get("debtor_number", ""),
+            },
+            "invoice": {
+                "id": ce.get("care_event_id"),
+                "invoicing_month": bd.get("invoicing_month", ""),
+                "invoice_number": invoice_number,
+                "care_account": ce.get("care_account", ""),
+                "event_type": event_type,
+                "care_range_begin": ce.get("period_start_date", ""),
+                "care_range_end": ce.get("period_end_date", ""),
+                "sum_total": bd.get("sum_total", 0),
+                "sum_covered": bd.get("sum_covered", 0),
+                "amount_owed": bd.get("amount_owed", 0),
+            },
+            "services": mapped_services
+        }
+        
+        # Import invoice generator
+        from app.invoice_generator import generate_invoice_pdf
+        
+        # Generate PDF
+        pdf_path = generate_invoice_pdf(data)
+        
+        return {
+            "status": "ok",
+            "message": "PDF generated successfully",
+            "pdf_path": str(pdf_path)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Regenerate PDF error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/billing/detail/{billing_detail_id}/view-pdf")
+def view_billing_pdf(billing_detail_id: str):
+    """Open the generated PDF for a billing detail."""
+    try:
+        from app.db.connection import get_database
+        import subprocess
+        from pathlib import Path
+        
+        db = get_database()
+        org_id = "org_default"
+        
+        # Get billing_detail
+        bd = db.billing_details.find_one({
+            "org_id": org_id,
+            "billing_detail_id": billing_detail_id
+        })
+        if not bd:
+            raise HTTPException(status_code=404, detail="Billing detail not found")
+        
+        invoice_number = bd.get("invoice_number")
+        if not invoice_number:
+            raise HTTPException(status_code=400, detail="Keine Rechnung generiert. Bitte zuerst PDF generieren.")
+        
+        # Find PDF file by invoice number
+        output_dir = Path("output/invoices")
+        pdf_files = list(output_dir.glob(f"*{invoice_number}*.pdf"))
+        
+        if not pdf_files:
+            raise HTTPException(status_code=404, detail=f"PDF nicht gefunden für Rechnungsnummer {invoice_number}")
+        
+        # Open the most recent matching PDF
+        pdf_path = max(pdf_files, key=lambda p: p.stat().st_mtime)
+        subprocess.run(["open", str(pdf_path)], check=False)
+        
+        return {
+            "status": "ok",
+            "message": "PDF opened",
+            "pdf_path": str(pdf_path)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"View PDF error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class BillingStatusUpdate(BaseModel):
+    billing_status: str
+
+
+@app.patch("/billing/detail/{billing_detail_id}/status")
+def update_billing_status(billing_detail_id: str, request: BillingStatusUpdate):
+    """Update the billing status of a billing detail."""
+    valid_statuses = ["", "invoice_needed", "sent", "paid"]
+    if request.billing_status not in valid_statuses:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid status. Must be one of: {valid_statuses}"
+        )
+    
+    try:
+        from app.db.connection import get_database
+        db = get_database()
+        
+        org_id = "org_default"
+        result = db.billing_details.update_one(
+            {"org_id": org_id, "billing_detail_id": billing_detail_id},
+            {"$set": {"billing_status": request.billing_status}}
+        )
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Billing detail not found")
+        
+        return {"status": "ok", "billing_status": request.billing_status}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Update billing status error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 

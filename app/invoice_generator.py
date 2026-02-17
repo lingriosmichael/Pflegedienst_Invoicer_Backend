@@ -4,7 +4,8 @@ from jinja2 import Environment, FileSystemLoader
 from weasyprint import HTML
 from datetime import datetime
 from app.database import get_private_invoice_cases
-# Future: from app.db.repositories import InvoiceRepository, PatientRepository, ServiceRepository
+# Use MongoDB repositories
+from app.db.mongodb_repositories import InvoiceRepository
 from collections import defaultdict
 import signal
 
@@ -142,7 +143,6 @@ def generate_invoice_pdf(data):
     return output_path
 
 def process_generate_invoices(invoicing_month=None):
-    from app.db.repositories import InvoiceRepository
     from app.database import get_orphaned_service_packet_cases
     
     cases = get_private_invoice_cases(invoicing_month)

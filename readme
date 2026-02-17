@@ -1,14 +1,36 @@
-## First deactivate any environment
-deactivate
+# Pflegedienst Invoicer - Run Instructions
 
-## Activate your Python venv (inside pflegedienst_invoicer):
+## 1. Start MongoDB (Docker)
+```bash
+cd ~/Documents/Invoicer/pflegedienst_invoicer
+docker-compose up -d
+```
 
-cd ~/Documents/pflegedienst_invoicer
-source .venv/bin/activate   # macOS / Linux
+## 2. Activate Python environment
+```bash
+cd ~/Documents/Invoicer/pflegedienst_invoicer
+source .venv/bin/activate
+```
 
-## Start FastAPI with Uvicorn
-
-uvicorn backend:app --reload
-
-# Or with specific host/port:
+## 3. Start FastAPI backend
+```bash
 uvicorn backend:app --reload --host 127.0.0.1 --port 8000
+```
+
+## Quick Start (all-in-one)
+```bash
+cd ~/Documents/Invoicer/pflegedienst_invoicer
+docker-compose up -d && source .venv/bin/activate && uvicorn backend:app --reload --host 127.0.0.1 --port 8000
+```
+
+## Stop Services
+```bash
+# Stop backend: Ctrl+C
+# Stop MongoDB:
+docker-compose down
+```
+
+## Check MongoDB status
+```bash
+docker ps  # Should show pflegedienst-mongo running
+```

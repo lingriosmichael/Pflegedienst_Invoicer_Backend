@@ -48,6 +48,7 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        extra = "allow"  # Allow extra fields from environment
         env_file_encoding = "utf-8"
 
 

@@ -201,8 +201,8 @@ def filter_chunks_by_mode(chunks, mode):
         chunk_id = chunk_item.get("chunk_id") if isinstance(chunk_item, dict) else None
 
         if mode == "sgbxi":
-            # Skip special Pflegekonto codes (4092, 4050, 4064)
-            if any(code in chunk_lower for code in ("pflegekonto: 4092", "pflegekonto: 4064")):
+            # SGB XI = 4030, 4010, 4020, 4062 — exclude 4092 (SGBV), 4064 (Entlastung), 4050 (Verhinderungspflege)
+            if any(code in chunk_lower for code in ("pflegekonto: 4092", "pflegekonto: 4064", "pflegekonto: 4050")):
                 logger.debug(f"Skipping chunk {i+1} (chunk_id={chunk_id}) — special pflegekonto.")
                 continue
 

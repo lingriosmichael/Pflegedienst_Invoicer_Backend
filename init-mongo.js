@@ -1,5 +1,9 @@
 // MongoDB initialization script
-// This runs automatically when MongoDB starts for the first time
+// This runs automatically when MongoDB starts for the first time.
+//
+// ⚠️  LOCAL DEVELOPMENT ONLY — these are default credentials for Docker.
+//     Override MONGO_APP_USER / MONGO_APP_PASSWORD via your .env file and
+//     update the credentials below before deploying to any shared environment.
 
 // Switch to admin database
 db = db.getSiblingDB('admin');

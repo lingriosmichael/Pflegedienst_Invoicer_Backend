@@ -7,6 +7,7 @@
 
 # Python
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.so
@@ -38,19 +39,35 @@ ENV/
 env.bak/
 venv.bak/
 
+# Node
+node_modules/
+
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+
+# macOS
 .DS_Store
+**/.DS_Store
 
 # Database
 *.db
 *.db-wal
 *.db-shm
+
+# Patient data and uploads (GDPR - never commit)
+data/abrechnung/
+data/chroma/
 data/invoices.db
+
+# AI response cache
+cache/
+
+# Legacy SQLite backup scripts
+.sqlite_backup/
 
 # Logs
 logs/
@@ -69,3 +86,4 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+.ruff_cache/

@@ -142,15 +142,32 @@ def generate_invoice_pdf(data):
 
     return output_path
 
-def process_generate_invoices(invoicing_month=None):
+def process_generate_invoices(
+    invoicing_month=None,
+    include_orphaned=True,
+    require_invoice_needed=True,
+):
     from app.database import get_orphaned_service_packet_cases
     
-    cases = get_private_invoice_cases(invoicing_month)
+    cases = get_private_invoice_cases(
+        invoicing_month=invoicing_month,
+        require_invoice_needed=require_invoice_needed,
+    )
     
     # After regular invoices, also generate invoices for orphaned service packets
-    if invoicing_month:
+    if include_orphaned and invoicing_month:
         orphaned_cases = get_orphaned_service_packet_cases(invoicing_month)
         cases.extend(orphaned_cases)
+
+    summary = {
+        "requested_month": invoicing_month,
+        "total_cases": len(cases),
+        "generated": 0,
+        "reused_invoice_numbers": 0,
+        "assigned_invoice_numbers": 0,
+        "failed": 0,
+        "failed_invoice_ids": [],
+    }
 
     for case in cases:
         try:
@@ -161,18 +178,24 @@ def process_generate_invoices(invoicing_month=None):
             if not current_number:
                 assigned_number = InvoiceRepository.get_next_invoice_number()
                 case["invoice"]["invoice_number"] = assigned_number
+                summary["assigned_invoice_numbers"] += 1
                 # Update in DB using repository (only if this is a real care event, not synthetic)
                 if not care_event_id.startswith("service_packet_"):
                     InvoiceRepository.update_invoice_number(care_event_id, assigned_number)
                 logger.info(f"Assigned invoice number {assigned_number} to care_event {care_event_id}")
             else:
+                summary["reused_invoice_numbers"] += 1
                 logger.info(f"Using existing invoice number {current_number} for care_event {care_event_id}")
 
             path = generate_invoice_pdf(case)
             logger.info(f"PDF created: {path}")
+            summary["generated"] += 1
 
         except Exception as e:
             invoice_number = case["invoice"].get("invoice_number", "[unknown]")
             logger.error(f"PDF failed for invoice {invoice_number}: {e}")
+            summary["failed"] += 1
+            summary["failed_invoice_ids"].append(case["invoice"].get("id"))
 
+    return summary
 

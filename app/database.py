@@ -36,6 +36,80 @@ def init_db():
     logger.info("✓ MongoDB database ready (init_db is no-op for MongoDB)")
 
 
+def _date_matches_invoicing_month(date_value: Any, invoicing_month: str) -> bool:
+    """Check whether a DD.MM.YY or DD.MM.YYYY date falls in MMYYYY."""
+    if not date_value or not invoicing_month:
+        return False
+
+    date_str = str(date_value).strip()
+    mm = invoicing_month[:2]
+    yyyy = invoicing_month[2:]
+    yy = yyyy[-2:]
+
+    return date_str.endswith(f".{mm}.{yy}") or date_str.endswith(f".{mm}.{yyyy}")
+
+
+def _care_event_matches_invoicing_month(care_event: Dict[str, Any], invoicing_month: str) -> bool:
+    """
+    Validate that a care_event actually belongs to the selected month.
+
+    We prefer the care period dates because historical data may contain
+    incorrectly assigned invoicing_month values on stored documents.
+    """
+    if not care_event or not invoicing_month:
+        return False
+
+    start_date = care_event.get("period_start_date")
+    end_date = care_event.get("period_end_date")
+
+    if start_date or end_date:
+        return (
+            _date_matches_invoicing_month(start_date, invoicing_month)
+            or _date_matches_invoicing_month(end_date, invoicing_month)
+        )
+
+    return care_event.get("invoicing_month") == invoicing_month
+
+
+def _resolve_invoice_amounts(event_type: str, ce: Dict[str, Any], bd: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Normalize invoice financial fields across care_event and billing_details.
+
+    SGBXI PDFs should stay aligned with the embedded service rows on the care_event.
+    Entleistung keeps sum_covered editable, so PDF rendering must respect the
+    stored covered value instead of reverse-deriving it from amount_owed.
+    """
+    bd = bd or {}
+
+    ce_sum_total = float(ce.get("sum_total", 0) or 0)
+    ce_sum_covered = float(ce.get("sum_covered", 0) or 0)
+    bd_sum_total = float(bd.get("sum_total", 0) or 0)
+    bd_sum_covered = float(bd.get("sum_covered", 0) or 0)
+    bd_amount_owed_raw = bd.get("amount_owed")
+    bd_amount_owed = float(bd_amount_owed_raw or 0)
+    investitionskosten = float(bd.get("investitionskosten", 0) or 0)
+
+    sum_total = ce_sum_total if ce_sum_total > 0 else bd_sum_total
+    sum_covered = ce_sum_covered if ce_sum_covered > 0 else bd_sum_covered
+    amount_owed = bd_amount_owed
+
+    if event_type == "SGBXI":
+        amount_owed = (
+            bd_amount_owed
+            if bd_amount_owed_raw is not None
+            else round(max(sum_total - sum_covered + investitionskosten, 0), 2)
+        )
+    else:
+        if bd_amount_owed_raw is None:
+            amount_owed = round(max(sum_total - sum_covered, 0), 2)
+
+    return {
+        "sum_total": round(sum_total, 2),
+        "sum_covered": round(sum_covered, 2),
+        "amount_owed": round(amount_owed, 2),
+    }
+
+
 # ============================================================================
 # Billing Summary Functions
 # ============================================================================
@@ -411,8 +485,11 @@ def insert_care_record(data: Dict, record_type: str, pflegekonto: str,
 # Invoice Generation Functions
 # ============================================================================
 
-def get_private_invoice_cases(invoicing_month: Optional[str] = None, 
-                               invoice_id: Optional[str] = None) -> List[Dict]:
+def get_private_invoice_cases(
+    invoicing_month: Optional[str] = None,
+    invoice_id: Optional[str] = None,
+    require_invoice_needed: bool = True,
+) -> List[Dict]:
     """
     Get invoices needing private invoices.
     Filters for event_type='SGBXI' or 'Entleistung' (billable types only).
@@ -420,6 +497,7 @@ def get_private_invoice_cases(invoicing_month: Optional[str] = None,
     Args:
         invoicing_month: Month to filter (MMYYYY format)
         invoice_id: Specific care_event_id to fetch
+        require_invoice_needed: Restrict month queries to billing_status=invoice_needed
         
     Returns:
         List of invoice case dictionaries
@@ -457,13 +535,16 @@ def get_private_invoice_cases(invoicing_month: Optional[str] = None,
                     cases.append(case)
         else:
             # Get all billable invoices for month
+            billing_match = {
+                "org_id": DEFAULT_ORG_ID,
+                "invoicing_month": invoicing_month,
+            }
+            if require_invoice_needed:
+                billing_match["billing_status"] = "invoice_needed"
+
             pipeline = [
                 {
-                    "$match": {
-                        "org_id": DEFAULT_ORG_ID,
-                        "invoicing_month": invoicing_month,
-                        "billing_status": "invoice_needed"
-                    }
+                    "$match": billing_match
                 },
                 {
                     "$lookup": {
@@ -514,6 +595,18 @@ def get_private_invoice_cases(invoicing_month: Optional[str] = None,
                 ce = doc.get("care_event", {})
                 bd = doc
                 patient = doc.get("patient", {})
+
+                if invoicing_month and not _care_event_matches_invoicing_month(ce, invoicing_month):
+                    logger.warning(
+                        "Skipping billing_detail %s for requested month %s because linked "
+                        "care_event %s has period %s to %s",
+                        bd.get("billing_detail_id"),
+                        invoicing_month,
+                        ce.get("care_event_id"),
+                        ce.get("period_start_date"),
+                        ce.get("period_end_date"),
+                    )
+                    continue
                 
                 case = _build_invoice_case(ce, bd, patient)
                 if case:
@@ -535,6 +628,7 @@ def _build_invoice_case(ce: Dict, bd: Optional[Dict], patient: Dict) -> Optional
     
     bd = bd or {}
     event_type = ce.get("event_type", "")
+    amounts = _resolve_invoice_amounts(event_type, ce, bd)
     
     # Build address from components
     street_name = patient.get("street_name", "") or ""
@@ -551,9 +645,9 @@ def _build_invoice_case(ce: Dict, bd: Optional[Dict], patient: Dict) -> Optional
             "id": ce.get("care_event_id"),
             "invoicing_month": bd.get("invoicing_month") or ce.get("invoicing_month"),
             "invoice_number": bd.get("invoice_number"),
-            "amount_owed": bd.get("amount_owed", 0),
-            "sum_covered": bd.get("sum_covered") or ce.get("sum_covered", 0),
-            "sum_total": bd.get("sum_total") or ce.get("sum_total", 0),
+            "amount_owed": amounts["amount_owed"],
+            "sum_covered": amounts["sum_covered"],
+            "sum_total": amounts["sum_total"],
             "care_range_begin": ce.get("period_start_date"),
             "care_range_end": ce.get("period_end_date"),
             "care_account": ce.get("care_account"),
@@ -606,27 +700,14 @@ def get_orphaned_service_packet_cases(invoicing_month: str) -> List[Dict]:
         
         for patient in service_packet_patients:
             patient_id = patient.get("patient_id")
-            
-            # Check if they have any SGBXI billing_details for this month
-            existing_billing = db.billing_details.find_one({
-                "org_id": DEFAULT_ORG_ID,
-                "invoicing_month": invoicing_month,
-                "billing_status": "invoice_needed",
-                "$or": [
-                    # Check via lookup to care_events
-                    {"care_event_id": {"$exists": True}}
-                ]
-            })
-            
-            # If we need to check if this patient has SGBXI for this month
-            sgbxi_event = db.care_events.find_one({
+
+            sgbxi_events = list(db.care_events.find({
                 "org_id": DEFAULT_ORG_ID,
                 "patient_id": patient_id,
                 "event_type": "SGBXI",
-                "invoicing_month": invoicing_month
-            })
-            
-            if sgbxi_event:
+            }))
+
+            if any(_care_event_matches_invoicing_month(event, invoicing_month) for event in sgbxi_events):
                 # Patient has SGBXI invoice, skip
                 continue
             
@@ -868,6 +949,17 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
             care_event_id = ce.get("care_event_id")
             patient_id = ce.get("patient_id")
             event_type = ce.get("event_type")
+
+            if not _care_event_matches_invoicing_month(ce, invoicing_month):
+                logger.warning(
+                    "Skipping care_event %s while marking %s ready because the period %s to %s "
+                    "does not belong to that invoicing month",
+                    care_event_id,
+                    invoicing_month,
+                    ce.get("period_start_date"),
+                    ce.get("period_end_date"),
+                )
+                continue
             
             # Skip if already has billing_details
             if care_event_id in existing_billings:
@@ -975,14 +1067,32 @@ def validate_and_fix_sgbxi_amounts() -> Dict[str, Any]:
             care_event_id = ce.get("care_event_id")
             sum_covered = ce.get("sum_covered", 0)
             sum_total = ce.get("sum_total", 0)
+            corrected_sum_covered = sum_total
+            corrected_sum_total = sum_covered
             
             # Swap them
             db.care_events.update_one(
                 {"care_event_id": care_event_id, "org_id": DEFAULT_ORG_ID},
                 {
                     "$set": {
-                        "sum_covered": sum_total,
-                        "sum_total": sum_covered,
+                        "sum_covered": corrected_sum_covered,
+                        "sum_total": corrected_sum_total,
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+
+            # Keep billing_details in sync with the corrected care_event totals.
+            investitionskosten = corrected_sum_total * 0.06
+            amount_owed = corrected_sum_total - corrected_sum_covered + investitionskosten
+            db.billing_details.update_many(
+                {"care_event_id": care_event_id, "org_id": DEFAULT_ORG_ID},
+                {
+                    "$set": {
+                        "sum_covered": corrected_sum_covered,
+                        "sum_total": corrected_sum_total,
+                        "investitionskosten": investitionskosten,
+                        "amount_owed": amount_owed,
                         "updated_at": datetime.utcnow()
                     }
                 }

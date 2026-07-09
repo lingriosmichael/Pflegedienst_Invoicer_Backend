@@ -162,11 +162,19 @@ def split_into_chunks(text):
 def clean_4064(structured):
     """
     For Entleistung (4064) invoices, set summe_covered based on the total amount.
-    Entleistung is capped at 127.50 EUR per month by insurance:
-    - If total <= 127.50: summe_covered = total (fully covered)
-    - If total > 127.50: summe_covered = 127.50 (patient pays the rest)
+    Entleistung is capped at 127.35 EUR per month by insurance:
+    - If total <= 127.35: summe_covered = total (fully covered)
+    - If total > 127.35: summe_covered = 127.35 (patient pays the rest)
     """
-    if structured["patient"].get("pflege_konto") == "4064":
+    invoice = structured.get("invoice", {})
+    patient = structured.get("patient", {})
+    care_account = (
+        invoice.get("care_account")
+        or invoice.get("pflege_konto")
+        or patient.get("pflege_konto")
+    )
+
+    if str(care_account).strip() == "4064":
         invoice = structured["invoice"]
         summe_total = invoice.get("summe_total", "0")
         
@@ -178,12 +186,12 @@ def clean_4064(structured):
         
         # If not extracted, determine covered amount based on total
         if not invoice.get("summe_covered"):
-            if total_value <= 127.50:
-                # Fully covered if under or equal to 127.50
+            if total_value <= 127.35:
+                # Fully covered if under or equal to 127.35
                 invoice["summe_covered"] = summe_total
             else:
-                # Capped at 127.50 if over
-                invoice["summe_covered"] = "127,50"
+                # Capped at 127.35 if over
+                invoice["summe_covered"] = "127,35"
 
 def filter_chunks_by_mode(chunks, mode):
     """

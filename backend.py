@@ -14,6 +14,7 @@ import app.invoice_generator as invoice_generator
 import app.pdf_parser as pdf_parser
 from app.db import create_collections_and_indexes
 from app.db.mongodb_config import health_check as mongodb_health_check
+from app.core import auth as auth_core
 import uuid
 from datetime import datetime
 import logging
@@ -22,29 +23,43 @@ from app.core.logging import setup_logging, get_logger
 logger = get_logger(__name__)
 setup_logging()
 
-API_KEY = os.getenv("API_KEY")
-if not API_KEY:
-    raise RuntimeError(
-        "API_KEY environment variable must be set. "
-        "Generate one (e.g. `openssl rand -hex 32`) and add it to .env."
-    )
-
-# Paths that must remain reachable without the API key (load balancer / uptime checks).
-PUBLIC_PATHS = {"/health"}
+# Paths that must remain reachable without a session token.
+PUBLIC_PATHS = {"/health", "/auth/login"}
 
 app = FastAPI()
 
 
 @app.middleware("http")
-async def require_api_key(request: Request, call_next):
+async def require_auth(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
         return await call_next(request)
 
-    provided_key = request.headers.get("x-api-key")
-    if provided_key != API_KEY:
-        return JSONResponse(status_code=401, content={"detail": "Missing or invalid API key"})
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse(status_code=401, content={"detail": "Missing bearer token"})
+
+    token = auth_header[len("Bearer "):]
+    try:
+        auth_core.decode_access_token(token)
+    except auth_core.InvalidTokenError:
+        return JSONResponse(status_code=401, content={"detail": "Invalid or expired session"})
 
     return await call_next(request)
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/auth/login")
+def login(req: LoginRequest):
+    try:
+        auth_core.verify_login(req.username, req.password)
+    except auth_core.InvalidCredentialsError:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    token = auth_core.create_access_token(req.username)
+    return {"access_token": token, "token_type": "bearer"}
 
 
 app.add_middleware(

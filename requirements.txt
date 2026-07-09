@@ -11,6 +11,8 @@ python-multipart
 python-dotenv
 pydantic-settings
 keyring
+bcrypt
+PyJWT
 plotly
 pandas
 numpy

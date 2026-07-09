@@ -10,7 +10,7 @@ services:
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:?Set MONGO_ROOT_USER in .env}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?Set MONGO_ROOT_PASSWORD in .env}
-      MONGO_INITDB_DATABASE: ${MONGODB_DB_NAME:-pflegedienst_invoicer}
+      MONGO_INITDB_DATABASE: ${MONGODB_DB_NAME:-pflegedienst_db}
 
     # Ports (bound to localhost only — never expose the DB port publicly)
     ports:

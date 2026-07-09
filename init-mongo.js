@@ -16,7 +16,7 @@ if (!db.getUser('pflegedienst_user')) {
         roles: [
             {
                 role: 'readWrite',
-                db: 'pflegedienst_invoicer'
+                db: 'pflegedienst_db'
             }
         ]
     });
@@ -26,7 +26,7 @@ if (!db.getUser('pflegedienst_user')) {
 }
 
 // Switch to application database
-db = db.getSiblingDB('pflegedienst_invoicer');
+db = db.getSiblingDB('pflegedienst_db');
 
 // Create collections with validators
 // This ensures data structure consistency

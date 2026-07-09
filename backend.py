@@ -25,7 +25,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:1420",     
+        "http://localhost:1420",
         "http://127.0.0.1:1420",
         "tauri://localhost",
         "http://localhost:5173",      # Vite dev server
@@ -143,9 +143,9 @@ def reimport_pdf(filename: str = Form(...), abrechnungsmonat: str = Form(...), i
     """Re-import a previously imported PDF file"""
     import hashlib
     from pathlib import Path
-    
+
     pdf_path = Path("data/abrechnung") / filename
-    
+
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {filename}")
     
@@ -235,8 +235,39 @@ def generate_invoices(req: InvoiceRequest):
     # First mark invoices ready based on amount_owed and service packet flag
     database.mark_month_ready_for_generation(req.abrechnungsmonat, legacy_entleistung=True)
     # Then generate the invoices
-    invoice_generator.process_generate_invoices(req.abrechnungsmonat)
-    return {"status": "ok", "message": "Rechnungen erstellt"}
+    result = invoice_generator.process_generate_invoices(req.abrechnungsmonat)
+    return {
+        "status": "ok",
+        "message": "Rechnungen erstellt",
+        "abrechnungsmonat": req.abrechnungsmonat,
+        "generated": result["generated"],
+        "total_cases": result["total_cases"],
+        "failed": result["failed"],
+    }
+
+
+@app.post("/regenerate_invoices")
+def regenerate_invoices(req: InvoiceRequest):
+    """
+    Regenerate PDFs for an already prepared month without re-running mark_ready.
+
+    This reuses the existing invoice numbers where present and only includes
+    billing rows whose linked care_event period actually belongs to the
+    requested month.
+    """
+    result = invoice_generator.process_generate_invoices(
+        req.abrechnungsmonat,
+        include_orphaned=False,
+        require_invoice_needed=False,
+    )
+    return {
+        "status": "ok",
+        "message": "Rechnungen neu erstellt",
+        "abrechnungsmonat": req.abrechnungsmonat,
+        "generated": result["generated"],
+        "total_cases": result["total_cases"],
+        "failed": result["failed"],
+    }
 
 
 @app.post("/complete_data")
@@ -1274,6 +1305,41 @@ def get_consultations_data():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/analytics/ausbildungspauschale")
+def get_ausbildungspauschale_data():
+    """Get Ausbildungspauschale (service_code 01013021) grouped by month."""
+    try:
+        from app.db.connection import get_database
+
+        db = get_database()
+        org_id = "org_default"
+
+        pipeline = [
+            {"$match": {"org_id": org_id}},
+            {"$unwind": "$services"},
+            {"$match": {"services.service_code": "01013021"}},
+            {
+                "$group": {
+                    "_id": "$period_start_date",
+                    "record_count": {"$sum": 1},
+                    "total_amount": {"$sum": {"$toDouble": "$services.line_total"}}
+                }
+            },
+            {"$sort": {"_id": 1}}
+        ]
+
+        rows = list(db.care_events.aggregate(pipeline))
+        data = _format_date_grouped_analytics(rows)
+
+        return {
+            "status": "ok",
+            "data": data
+        }
+    except Exception as e:
+        logger.error(f"Ausbildungspauschale data error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/analytics/consultations/patient/{patient_id}")
 def get_consultations_by_patient(patient_id: str):
     """Get Consultations for a specific patient grouped by month from MongoDB."""
@@ -1359,6 +1425,89 @@ def get_consultations_by_patient(patient_id: str):
         }
     except Exception as e:
         logger.error(f"Consultations patient data error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/ausbildungspauschale/patient/{patient_id}")
+def get_ausbildungspauschale_by_patient(patient_id: str):
+    """Get Ausbildungspauschale (service_code 01013021) for a patient grouped by month."""
+    try:
+        from app.db.connection import get_database
+        from datetime import datetime
+
+        db = get_database()
+        org_id = "org_default"
+
+        patient_id_int = None
+        try:
+            patient_id_int = int(patient_id)
+        except (ValueError, TypeError):
+            pass
+
+        match_query = {"org_id": org_id, "services.service_code": "01013021"}
+        if patient_id_int is not None:
+            match_query["patient_id"] = {"$in": [patient_id, patient_id_int]}
+        else:
+            match_query["patient_id"] = patient_id
+
+        pipeline = [
+            {"$match": match_query},
+            {"$unwind": "$services"},
+            {"$match": {"services.service_code": "01013021"}},
+            {
+                "$group": {
+                    "_id": "$period_start_date",
+                    "total_amount": {"$sum": {"$toDouble": "$services.line_total"}}
+                }
+            },
+            {"$sort": {"_id": 1}}
+        ]
+
+        rows = list(db.care_events.aggregate(pipeline))
+
+        month_data = {}
+        years_present = set()
+
+        for row in rows:
+            date_str = row.get("_id")
+            amount = row.get("total_amount", 0)
+
+            if date_str:
+                try:
+                    date_str = str(date_str).strip()
+                    try:
+                        dt = datetime.strptime(date_str, "%d.%m.%y")
+                    except ValueError:
+                        dt = datetime.strptime(date_str, "%d.%m.%Y")
+
+                    month_key = dt.strftime("%m%Y")
+                    month_display = dt.strftime("%m/%Y")
+                    year = dt.strftime("%Y")
+                    years_present.add(year)
+
+                    if month_key not in month_data:
+                        month_data[month_key] = {"month": month_display, "total_amount": 0.0}
+
+                    month_data[month_key]["total_amount"] += float(amount) if amount else 0.0
+                except (ValueError, TypeError) as pe:
+                    logger.warning(f"Could not parse date: {date_str}, error: {pe}")
+
+        if years_present:
+            for year in sorted(years_present):
+                for month_num in range(1, 13):
+                    month_key = f"{month_num:02d}{year}"
+                    if month_key not in month_data:
+                        month_display = f"{month_num:02d}/{year}"
+                        month_data[month_key] = {"month": month_display, "total_amount": 0.0}
+
+        data = sorted(month_data.values(), key=lambda x: x["month"])
+
+        return {
+            "status": "ok",
+            "data": data
+        }
+    except Exception as e:
+        logger.error(f"Ausbildungspauschale patient data error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1557,6 +1706,13 @@ def update_billing_detail_services(billing_detail_id: str, request: ServicesUpda
         })
         if not bd:
             raise HTTPException(status_code=404, detail="Billing detail not found")
+
+        ce = db.care_events.find_one({
+            "org_id": org_id,
+            "care_event_id": bd["care_event_id"]
+        })
+        if not ce:
+            raise HTTPException(status_code=404, detail="Care event not found")
         
         # Build updated services with recalculated line_totals
         updated_services = []
@@ -1574,8 +1730,21 @@ def update_billing_detail_services(billing_detail_id: str, request: ServicesUpda
             new_sum_total += line_total
         
         new_sum_total = round(new_sum_total, 2)
-        new_sum_covered = request.sum_covered if request.sum_covered is not None else new_sum_total
-        
+        event_type = ce.get("event_type", "")
+
+        if request.sum_covered is not None:
+            new_sum_covered = request.sum_covered
+        elif event_type == "Entleistung":
+            new_sum_covered = min(new_sum_total, 127.35)
+        else:
+            new_sum_covered = new_sum_total
+
+        investitionskosten = round(new_sum_total * 0.06, 2) if event_type == "SGBXI" else 0.0
+        if event_type == "SGBXI":
+            new_amount_owed = round(max(new_sum_total - new_sum_covered + investitionskosten, 0), 2)
+        else:
+            new_amount_owed = round(max(new_sum_total - new_sum_covered, 0), 2)
+
         # Update care_event services and totals
         db.care_events.update_one(
             {"org_id": org_id, "care_event_id": bd["care_event_id"]},
@@ -1588,7 +1757,7 @@ def update_billing_detail_services(billing_detail_id: str, request: ServicesUpda
                 }
             }
         )
-        
+
         # Update billing_detail totals
         db.billing_details.update_one(
             {"org_id": org_id, "billing_detail_id": billing_detail_id},
@@ -1596,6 +1765,8 @@ def update_billing_detail_services(billing_detail_id: str, request: ServicesUpda
                 "$set": {
                     "sum_total": new_sum_total,
                     "sum_covered": new_sum_covered,
+                    "investitionskosten": investitionskosten,
+                    "amount_owed": new_amount_owed,
                     "updated_at": datetime.now().isoformat()
                 }
             }
@@ -1606,6 +1777,7 @@ def update_billing_detail_services(billing_detail_id: str, request: ServicesUpda
             "message": "Services updated successfully",
             "sum_total": new_sum_total,
             "sum_covered": new_sum_covered,
+            "amount_owed": new_amount_owed,
             "services_count": len(updated_services)
         }
     except HTTPException:
@@ -1650,6 +1822,7 @@ def regenerate_billing_pdf(billing_detail_id: str):
             raise HTTPException(status_code=404, detail="Patient not found")
         
         event_type = ce.get("event_type", "")
+        amounts = database._resolve_invoice_amounts(event_type, ce, bd)
         
         # Assign invoice number if not present
         invoice_number = bd.get("invoice_number")
@@ -1702,9 +1875,9 @@ def regenerate_billing_pdf(billing_detail_id: str):
                 "event_type": event_type,
                 "care_range_begin": ce.get("period_start_date", ""),
                 "care_range_end": ce.get("period_end_date", ""),
-                "sum_total": bd.get("sum_total", 0),
-                "sum_covered": bd.get("sum_covered", 0),
-                "amount_owed": bd.get("amount_owed", 0),
+                "sum_total": amounts["sum_total"],
+                "sum_covered": amounts["sum_covered"],
+                "amount_owed": amounts["amount_owed"],
             },
             "services": mapped_services
         }
@@ -1806,5 +1979,3 @@ def update_billing_status(billing_detail_id: str, request: BillingStatusUpdate):
     except Exception as e:
         logger.error(f"Update billing status error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-

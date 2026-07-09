@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Form, Request
 from pydantic import BaseModel
 from typing import List, Optional
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi import HTTPException
 import traceback
@@ -13,6 +13,7 @@ import app.database as database
 import app.invoice_generator as invoice_generator
 import app.pdf_parser as pdf_parser
 from app.db import create_collections_and_indexes
+from app.db.mongodb_config import health_check as mongodb_health_check
 import uuid
 from datetime import datetime
 import logging
@@ -21,7 +22,31 @@ from app.core.logging import setup_logging, get_logger
 logger = get_logger(__name__)
 setup_logging()
 
+API_KEY = os.getenv("API_KEY")
+if not API_KEY:
+    raise RuntimeError(
+        "API_KEY environment variable must be set. "
+        "Generate one (e.g. `openssl rand -hex 32`) and add it to .env."
+    )
+
+# Paths that must remain reachable without the API key (load balancer / uptime checks).
+PUBLIC_PATHS = {"/health"}
+
 app = FastAPI()
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
+        return await call_next(request)
+
+    provided_key = request.headers.get("x-api-key")
+    if provided_key != API_KEY:
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid API key"})
+
+    return await call_next(request)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -99,15 +124,34 @@ async def startup_event():
 # ------------------------------
 # Endpoints
 # ------------------------------
+@app.get("/health")
+def health():
+    mongo_ok = mongodb_health_check()
+    return JSONResponse(
+        status_code=200 if mongo_ok else 503,
+        content={"status": "ok" if mongo_ok else "degraded", "mongodb": mongo_ok},
+    )
+
+
+def _safe_upload_filename(original_filename: str) -> str:
+    """Build a filesystem-safe filename that cannot escape UPLOAD_DIR."""
+    base_name = os.path.basename(original_filename or "")
+    if not base_name.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only .pdf files are accepted")
+    safe_stem = "".join(c for c in os.path.splitext(base_name)[0] if c.isalnum() or c in ("-", "_")) or "upload"
+    return f"{safe_stem}_{uuid.uuid4().hex[:8]}.pdf"
+
+
 @app.post("/upload_pdf")
 def upload_pdf(file: UploadFile = File(...), abrechnungsmonat: str = Form(...)):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    safe_filename = _safe_upload_filename(file.filename)
+    file_path = os.path.join(UPLOAD_DIR, safe_filename)
 
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    return {"status": "stored", "filename": file.filename}
+    return {"status": "stored", "filename": safe_filename}
 
 @app.get("/previous_imports")
 def get_previous_imports():
@@ -144,9 +188,10 @@ def reimport_pdf(filename: str = Form(...), abrechnungsmonat: str = Form(...), i
     import hashlib
     from pathlib import Path
 
-    pdf_path = Path("data/abrechnung") / filename
+    abrechnung_dir = Path("data/abrechnung").resolve()
+    pdf_path = (abrechnung_dir / os.path.basename(filename)).resolve()
 
-    if not pdf_path.exists():
+    if abrechnung_dir not in pdf_path.parents or not pdf_path.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {filename}")
     
     try:

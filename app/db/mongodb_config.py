@@ -10,9 +10,14 @@ This module handles:
 
 import os
 import logging
+from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 from pymongo.server_api import ServerApi
+
+# This module reads MONGODB_URI at import time, which can happen before any
+# other module has loaded .env (import order across app/ is not guaranteed).
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +25,12 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION FROM ENVIRONMENT
 # ============================================================================
 
-MONGODB_URI = os.getenv(
-    "MONGODB_URI",
-    "mongodb://admin:changeme@localhost:27017/admin?authSource=admin"
-)
+MONGODB_URI = os.getenv("MONGODB_URI")
+if not MONGODB_URI:
+    raise RuntimeError(
+        "MONGODB_URI environment variable must be set (no insecure default is provided). "
+        "Set it in .env, e.g. mongodb://<user>:<password>@localhost:27017/admin?authSource=admin"
+    )
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "pflegedienst_db")
 
 # Connection pooling settings

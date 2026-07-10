@@ -1,26 +1,29 @@
-PyMuPDF
-pdfplumber
-pytesseract
-Pillow
-WeasyPrint
-Jinja2
-requests
-fastapi 
-uvicorn[standard]
-python-multipart
-python-dotenv
-pydantic-settings
-keyring
-bcrypt
-PyJWT
-plotly
-pandas
-numpy
+PyMuPDF==1.26.4
+pdfplumber==0.11.7
+pytesseract==0.3.13
+Pillow==11.3.0
+WeasyPrint==66.0
+Jinja2==3.1.6
+requests==2.32.5
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+python-multipart==0.0.20
+python-dotenv==1.1.1
+pydantic==2.11.7
+pydantic_core==2.33.2
+pydantic-settings==2.12.0
+keyring==25.7.0
+bcrypt==5.0.0
+PyJWT==2.13.0
+plotly==6.5.0
+pandas==2.3.3
+numpy==2.3.5
+openai==1.107.1
 
 # Database - MongoDB
-pymongo>=4.6
-motor>=3.3
+pymongo==4.16.0
+motor==3.7.1
 
 # Testing
-pytest
-mongomock
+pytest==9.0.1
+mongomock==4.3.0

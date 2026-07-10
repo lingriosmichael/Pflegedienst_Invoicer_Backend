@@ -1,0 +1,38 @@
+name: Backend CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      # WeasyPrint (invoice PDFs) and pytesseract (OCR) need system libraries
+      # beyond what pip installs, so the app itself can be imported in CI.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpango-1.0-0 libpangoft2-1.0-0 tesseract-ocr
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+      - name: Verify backend module imports cleanly
+        run: |
+          export API_KEY=ci-placeholder-key
+          export MONGODB_URI=mongodb://localhost:27017/ci_placeholder
+          python -c "import backend"

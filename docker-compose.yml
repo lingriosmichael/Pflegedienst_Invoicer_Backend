@@ -1,4 +1,8 @@
-version: '3.8'
+# Note: `docker compose` prints "variable is not set" warnings referencing
+# fragments of ADMIN_PASSWORD_HASH from .env — that's Compose's own .env
+# pre-scan for ${...} substitution tripping over the bcrypt hash's literal
+# "$" characters. Harmless: the backend service reads .env directly via a
+# file mount (see below), never through Compose's interpolation pipeline.
 
 services:
   mongodb:
@@ -48,6 +52,52 @@ services:
         max-file: "3"
     
     # Security
+    security_opt:
+      - no-new-privileges:true
+
+  backend:
+    build: .
+    container_name: pflegedienst_backend
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+    environment:
+      # Override MONGODB_URI from .env: inside this network the DB is reachable
+      # by service name ("mongodb"), not "localhost" (which .env is set up for
+      # when running the backend directly on the host). The app's own
+      # load_dotenv() never overrides an already-set env var, so this wins
+      # over whatever MONGODB_URI is in the mounted .env file below.
+      MONGODB_URI: mongodb://${MONGO_APP_USER:?Set MONGO_APP_USER in .env}:${MONGO_APP_PASSWORD:?Set MONGO_APP_PASSWORD in .env}@mongodb:27017/${MONGODB_DB_NAME:-pflegedienst_db}?authSource=admin
+
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./cache:/app/cache
+      - ./logs:/app/logs
+      # Mounted as a file, not env_file: Compose's env_file interpolation
+      # mangles literal "$" characters (bcrypt hashes are full of them,
+      # e.g. $2b$12$...). Reading it via the app's own load_dotenv() avoids
+      # that entirely and matches exactly how it's read on the host.
+      - ./.env:/app/.env:ro
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
     security_opt:
       - no-new-privileges:true
 

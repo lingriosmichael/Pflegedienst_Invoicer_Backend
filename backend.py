@@ -15,6 +15,11 @@ import app.pdf_parser as pdf_parser
 from app.db import create_collections_and_indexes
 from app.db.mongodb_config import health_check as mongodb_health_check
 from app.core import auth as auth_core
+from app.entlastung_balance import (
+    uses_new_entlastung_logic,
+    recompute_entlastung_for_care_event,
+    seed_entlastung_2026_balances,
+)
 import uuid
 from datetime import datetime
 import logging
@@ -131,7 +136,12 @@ async def startup_event():
         logger.info("Initializing MongoDB...")
         create_collections_and_indexes()
         logger.info("✓ MongoDB collections initialized")
-            
+
+        # Seed the 2026 Entlastungsleistung bucket for any patient that doesn't
+        # have one yet (idempotent — never touches an existing row).
+        seed_summary = seed_entlastung_2026_balances()
+        logger.info(f"✓ Entlastungsleistung 2026 balances: {seed_summary}")
+
     except Exception as e:
         logger.error(f"Failed to init database: {e}")
 
@@ -1791,8 +1801,18 @@ def update_billing_detail_services(billing_detail_id: str, request: ServicesUpda
         
         new_sum_total = round(new_sum_total, 2)
         event_type = ce.get("event_type", "")
+        invoicing_month = bd.get("invoicing_month", "")
 
-        if request.sum_covered is not None:
+        entlastung_recompute = None
+        if event_type == "Entleistung" and uses_new_entlastung_logic(invoicing_month):
+            # Balance-tracked months: covered/owed always come from the balance,
+            # never from a manually typed value, so used_amount stays in sync.
+            previously_covered = bd.get("sum_covered", 0) or 0
+            entlastung_recompute = recompute_entlastung_for_care_event(
+                ce.get("patient_id"), invoicing_month, new_sum_total, previously_covered
+            )
+            new_sum_covered = entlastung_recompute["covered"]
+        elif request.sum_covered is not None:
             new_sum_covered = request.sum_covered
         elif event_type == "Entleistung":
             new_sum_covered = min(new_sum_total, 127.35)
@@ -1800,7 +1820,9 @@ def update_billing_detail_services(billing_detail_id: str, request: ServicesUpda
             new_sum_covered = new_sum_total
 
         investitionskosten = round(new_sum_total * 0.06, 2) if event_type == "SGBXI" else 0.0
-        if event_type == "SGBXI":
+        if entlastung_recompute is not None:
+            new_amount_owed = entlastung_recompute["owed"]
+        elif event_type == "SGBXI":
             new_amount_owed = round(max(new_sum_total - new_sum_covered + investitionskosten, 0), 2)
         else:
             new_amount_owed = round(max(new_sum_total - new_sum_covered, 0), 2)

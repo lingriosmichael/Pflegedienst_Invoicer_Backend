@@ -28,37 +28,41 @@ def create_collections_and_indexes():
     3. billing_details - Invoice billing information
     4. billing_summary - Monthly billing summaries
     5. care_event_history - Audit trail
-    6. entlastungsleistung_tracking - Year-based tracking
+    6. entlastungsleistung_tracking - Legacy year-based tracking (unused, kept for reference)
     7. invoice_sequences - Global invoice number counter
-    
+    8. entlastung_year_balance - Entlastungsleistung yearly bucket balances
+
     Raises:
         Exception: If cannot connect to MongoDB or create collections
     """
     db = get_database()
-    
+
     logger.info("Initializing MongoDB collections and indexes...")
-    
+
     try:
         # Collection 1: patient_profiles
         _create_patient_profiles_collection(db)
-        
+
         # Collection 2: care_events
         _create_care_events_collection(db)
-        
+
         # Collection 3: billing_details
         _create_billing_details_collection(db)
-        
+
         # Collection 4: billing_summary
         _create_billing_summary_collection(db)
-        
+
         # Collection 5: care_event_history
         _create_care_event_history_collection(db)
-        
+
         # Collection 6: entlastungsleistung_tracking
         _create_entlastungsleistung_tracking_collection(db)
-        
+
         # Collection 7: invoice_sequences
         _create_invoice_sequences_collection(db)
+
+        # Collection 8: entlastung_year_balance
+        _create_entlastung_year_balance_collection(db)
         
         logger.info("✓ All MongoDB collections and indexes initialized successfully")
         
@@ -250,6 +254,22 @@ def _create_entlastungsleistung_tracking_collection(db):
         name="idx_org_patient_year_unique"
     )
     logger.debug(f"  ✓ Index: org_id + patient_id + calendar_year (unique, sparse, compound)")
+
+
+def _create_entlastung_year_balance_collection(db):
+    """Create entlastung_year_balance collection (yearly Entlastungsleistung bucket balances)."""
+    coll_name = "entlastung_year_balance"
+
+    if coll_name not in db.list_collection_names():
+        logger.debug(f"Creating collection: {coll_name}")
+        db.create_collection(coll_name)
+
+    db[coll_name].create_index(
+        [("org_id", 1), ("patient_id", 1), ("entitlement_year", 1)],
+        unique=True,
+        name="idx_org_patient_entitlement_year_unique"
+    )
+    logger.debug(f"  ✓ Index: org_id + patient_id + entitlement_year (unique, compound)")
 
 
 def _create_invoice_sequences_collection(db):

@@ -24,6 +24,7 @@ from app.db import (
     DEFAULT_ORG_ID,
 )
 from app.utils.data_validation import DataNormalizer, DataValidationError
+from app.entlastung_balance import uses_new_entlastung_logic, apply_entlastung_usage
 
 logger = logging.getLogger(__name__)
 
@@ -974,20 +975,35 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
                 investitionskosten = sum_total * 0.06
             
             # Entleistung special handling
-            if event_type == "Entleistung":
+            entlastung_new_logic = event_type == "Entleistung" and uses_new_entlastung_logic(invoicing_month)
+
+            if entlastung_new_logic:
+                # Balance-based coverage (from 082026 onward): consume the patient's
+                # year-bucket balance regardless of whether an invoice ends up needed.
+                usage = apply_entlastung_usage(patient_id, invoicing_month, sum_total)
+                sum_covered = usage["covered"]
+                amount_owed = usage["owed"]
+            elif event_type == "Entleistung":
                 ENTLEISTUNG_CAP = 127.35
                 sum_covered = min(sum_total, ENTLEISTUNG_CAP)
                 amount_owed = sum_total - sum_covered
             else:
                 amount_owed = sum_total - sum_covered + investitionskosten
-            
+
             # Determine if billing should be created
             should_create = False
             billing_status = "covered_insurance"
-            
+
             if event_type == "SGBXI":
                 should_create = True
                 billing_status = "invoice_needed"
+            elif entlastung_new_logic:
+                # Always persist a row so a re-run of mark_ready never re-applies
+                # the balance mutation for the same care_event twice (idempotency),
+                # and so covered-but-not-owed usage stays visible for audit/UI.
+                # Only invoice the patient privately for whatever the balance didn't cover.
+                should_create = True
+                billing_status = "invoice_needed" if amount_owed > 0 else "covered_insurance"
             elif event_type == "Entleistung":
                 if legacy_entleistung:
                     # Legacy: simple monthly threshold
@@ -995,9 +1011,9 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
                         should_create = True
                         billing_status = "invoice_needed"
                 else:
-                    # New: cumulative yearly limit (1500 EUR)
+                    # New (pre-082026 only): cumulative yearly limit (1500 EUR)
                     year = int(invoicing_month[-4:]) if len(invoicing_month) >= 6 else datetime.now().year
-                    
+
                     # Get cumulative for this patient/year
                     existing_events = db.care_events.find({
                         "org_id": DEFAULT_ORG_ID,
@@ -1005,9 +1021,9 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
                         "event_type": "Entleistung",
                         "invoicing_month": {"$regex": f".*{year}$"}
                     })
-                    
+
                     cumulative = sum(e.get("sum_total", 0) for e in existing_events)
-                    
+
                     if cumulative > 1500.0:
                         should_create = True
                         billing_status = "invoice_needed"

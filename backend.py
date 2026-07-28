@@ -43,8 +43,10 @@ app.add_middleware(
         "http://localhost:1420",
         "http://127.0.0.1:1420",
         "tauri://localhost",
-        "http://localhost:5173",      # Vite dev server
-        "http://127.0.0.1:5173",      # Vite dev server
+        "http://localhost:5173",      # Vite dev server (legacy)
+        "http://127.0.0.1:5173",      # Vite dev server (legacy)
+        "http://localhost:3000",      # Next.js dev server
+        "http://127.0.0.1:3000",      # Next.js dev server
     ],
     allow_credentials=True,
     allow_methods=["*"],

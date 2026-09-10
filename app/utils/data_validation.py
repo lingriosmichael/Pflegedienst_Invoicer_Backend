@@ -14,7 +14,7 @@ from app.utils.parsing import GermanDecimalParser
 logger = logging.getLogger(__name__)
 
 
-class DataValidationError(Exception):
+class DataValidationError(ValueError):
     """Raised when data validation fails."""
     pass
 
@@ -45,7 +45,7 @@ class DataNormalizer:
             # Return as string with "." decimal separator
             return GermanDecimalParser.to_float_string(float_val, decimal_places=2)
         except Exception as e:
-            raise DataValidationError(f"Cannot parse amount '{amount}': {e}")
+            raise DataValidationError("Invalid monetary amount") from None
     
     @staticmethod
     def normalize_birthdate(birthdate: Any) -> str:
@@ -95,6 +95,24 @@ class DataNormalizer:
                     raise DataValidationError(f"Cannot parse birthdate components: {e}")
         
         raise DataValidationError(f"Birthdate '{birthdate_str}' does not match expected format (DD.MM.YY or DD.MM.YYYY)")
+
+    @staticmethod
+    def normalize_patient_name(name: Any) -> str:
+        """Canonicalize all-caps source names without changing normal names.
+
+        RZH statements commonly use `NACHNAME, VORNAME`, while other sources
+        already provide well-cased names. The raw PDF value remains in its
+        evidence record; this is only the display/master-data form.
+        """
+        normalized = " ".join(str(name or "").strip().split())
+        if not normalized:
+            raise DataValidationError("Patient name is empty")
+        letters = [character for character in normalized if character.isalpha()]
+        if letters and all(character.isupper() for character in letters):
+            normalized = normalized.title()
+            for particle in ("Von", "Van", "Der", "Den", "De", "Del", "Da", "Di", "Zu", "Zur"):
+                normalized = re.sub(rf"\b{particle}\b", particle.lower(), normalized)
+        return normalized
     
     @staticmethod
     def validate_invoice_record(record: Dict[str, Any]) -> Tuple[bool, Optional[str]]:

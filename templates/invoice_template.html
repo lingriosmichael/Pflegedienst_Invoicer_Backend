@@ -116,12 +116,12 @@
 
 
   {% set pflegesumme = invoice.sum_total | float %}
-  {% set invest = pflegesumme * 0.06 %}
+  {% set invest = invoice.investitionskosten | float %}
   {% set covered = invoice.sum_covered | float %}
   {# Use per-patient flag stored in the database to determine service packet inclusion #}
   {% set needs_service_paket = (patient.include_service_packet | int) == 1 %}
   {% set service_fee = 40.00 if needs_service_paket else 0.00 %}
-  {% set final_total = pflegesumme + invest + service_fee - covered %}
+  {% set final_total = invoice.invoice_total | float %}
 
   <br>
   <table>

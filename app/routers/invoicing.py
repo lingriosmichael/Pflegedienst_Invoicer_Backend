@@ -1,6 +1,10 @@
 import traceback
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from app.db import DEFAULT_ORG_ID
+from app.db.mongodb_config import get_database
+from app.invoice_issuance import ensure_service_packets
+from app.utils.validation import BillingMonth
 
 import app.database as database
 import app.invoice_generator as invoice_generator
@@ -12,21 +16,93 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 class InvoiceRequest(BaseModel):
-    abrechnungsmonat: str
-@router.post("/generate_invoices")
-def generate_invoices(req: InvoiceRequest):
-    # First mark invoices ready based on amount_owed and service packet flag
-    database.mark_month_ready_for_generation(req.abrechnungsmonat, legacy_entleistung=True)
-    # Then generate the invoices
-    result = invoice_generator.process_generate_invoices(req.abrechnungsmonat)
+    abrechnungsmonat: BillingMonth
+
+
+def _sgbxi_candidates(invoicing_month: str):
+    """Return only normal SGB XI workflow rows, never Entlastungsleistung."""
+    database_connection = get_database()
+    bills = list(database_connection.billing_details.find({
+        "org_id": DEFAULT_ORG_ID,
+        "invoicing_month": invoicing_month,
+        "billing_status": "invoice_needed",
+    }).sort("billing_detail_id", 1))
+    events = {
+        event["care_event_id"]: event
+        for event in database_connection.care_events.find({
+            "org_id": DEFAULT_ORG_ID,
+            "care_event_id": {"$in": [bill["care_event_id"] for bill in bills]},
+            "event_type": {"$in": ["SGBXI", "ServicePacket"]},
+        })
+    }
+    patients = {
+        patient["patient_id"]: patient
+        for patient in database_connection.patient_profiles.find({
+            "org_id": DEFAULT_ORG_ID,
+            "patient_id": {"$in": [event["patient_id"] for event in events.values()]},
+        })
+    }
+    candidates = []
+    for bill in bills:
+        event = events.get(bill["care_event_id"])
+        if not event:
+            continue
+        patient = patients.get(event["patient_id"], {})
+        candidates.append({
+            "billing_detail_id": bill["billing_detail_id"],
+            "patient_name": patient.get("patient_name", "Unbekannter Patient"),
+            "care_event_id": event["care_event_id"],
+            "event_type": event["event_type"],
+            "service_period": f"{event.get('period_start_date', '')} – {event.get('period_end_date', '')}",
+            "sum_total": bill.get("sum_total", 0),
+            "sum_covered": bill.get("sum_covered", 0),
+            "investment_cost": bill.get("investitionskosten", 0),
+            "service_packet_amount": bill.get("service_packet_amount", 0),
+            "amount_owed": bill.get("amount_owed", 0),
+            "invoice_total": round((bill.get("amount_owed", 0) or 0) + (bill.get("service_packet_amount", 0) or 0), 2),
+        })
+    return candidates
+
+
+@router.post("/sgbxi-invoices/prepare")
+def prepare_sgbxi_invoices(req: InvoiceRequest):
+    """Prepare and list normal SGB XI invoices for explicit staff selection."""
+    created = database.mark_month_ready_for_generation(
+        req.abrechnungsmonat,
+        event_types=["SGBXI", "ServicePacket"],
+    )
+    # This can attach the monthly €40 packet to the appropriate SGB XI bill,
+    # or create a packet-only SGB XI workflow row. It never sees Entleistung.
+    ensure_service_packets(req.abrechnungsmonat)
     return {
         "status": "ok",
-        "message": "Rechnungen erstellt",
-        "abrechnungsmonat": req.abrechnungsmonat,
-        "generated": result["generated"],
-        "total_cases": result["total_cases"],
-        "failed": result["failed"],
+        "created": created,
+        "invoicing_month": req.abrechnungsmonat,
+        "candidates": _sgbxi_candidates(req.abrechnungsmonat),
     }
+
+
+@router.post("/sgbxi-invoices/issue-all")
+def issue_all_sgbxi_invoices(req: InvoiceRequest):
+    """Render every currently open SGB XI invoice for the requested month."""
+    billing_detail_ids = [candidate["billing_detail_id"] for candidate in _sgbxi_candidates(req.abrechnungsmonat)]
+    result = invoice_generator.process_generate_invoices(
+        req.abrechnungsmonat,
+        include_orphaned=False,
+        require_invoice_needed=True,
+        billing_detail_ids=billing_detail_ids,
+        allowed_event_types={"SGBXI", "ServicePacket"},
+    )
+    return {
+        "status": "ok",
+        "message": "SGB-XI-Rechnungen erstellt",
+        "invoicing_month": req.abrechnungsmonat,
+        **result,
+    }
+
+@router.post("/generate_invoices")
+def generate_invoices(req: InvoiceRequest):
+    raise HTTPException(410, "Use /sgbxi-invoices/prepare and issue-selected to choose SGB XI invoices explicitly")
 
 
 @router.post("/regenerate_invoices")
@@ -42,6 +118,7 @@ def regenerate_invoices(req: InvoiceRequest):
         req.abrechnungsmonat,
         include_orphaned=False,
         require_invoice_needed=False,
+        allowed_event_types={"SGBXI", "ServicePacket"},
     )
     return {
         "status": "ok",
@@ -66,12 +143,8 @@ def check_service_fields():
     return {"status": "ok", "message": "Leistungsdaten überprüft"}
 
 
-@router.post("/retry_failed")
-def retry_failed():
-    pdf_parser.refeed_failed_chunk_from_file()
-    return {"status": "ok", "message": "Fehlerhafte Abrechnungen erneut verarbeitet"}
 class MarkReadyRequest(BaseModel):
-    invoicing_month: str   # "MMYYYY"
+    invoicing_month: BillingMonth   # "MMYYYY"
     only_positive: bool = False
 
 @router.post("/mark_ready")
@@ -81,52 +154,16 @@ def mark_ready(req: MarkReadyRequest):
         if len(m) != 6 or not m.isdigit():
             raise HTTPException(status_code=400, detail="invoicing_month must be MMYYYY")
 
-        updated = database.mark_month_ready_for_generation(m, req.only_positive, legacy_entleistung=False)
+        updated = database.mark_month_ready_for_generation(
+            m, req.only_positive, event_types=["SGBXI", "ServicePacket"]
+        )
         return {"status": "ok", "updated": updated}
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"/mark_ready error:\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/mark_ready_legacy")
-def mark_ready_legacy(req: MarkReadyRequest):
-    """
-    Mark month ready for generation using LEGACY Entleistung logic.
-    Legacy logic: Anything > 125 EUR per month gets invoiced (simple monthly threshold).
-    Use this for December 2025 and earlier months before the yearly cumulative logic was implemented.
-    """
-    try:
-        m = (req.invoicing_month or "").strip()
-        if len(m) != 6 or not m.isdigit():
-            raise HTTPException(status_code=400, detail="invoicing_month must be MMYYYY")
-
-        updated = database.mark_month_ready_for_generation(m, req.only_positive, legacy_entleistung=True)
-        return {"status": "ok", "updated": updated}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"/mark_ready_legacy error:\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("Operation failed (%s)", type(e).__name__)
+        raise HTTPException(status_code=500, detail="Operation failed; verify input and database readiness")
 
 @router.post("/validate_sgbxi_amounts")
-async def validate_sgbxi_amounts():
-    """
-    Validate all SGBXI records and auto-correct any reversed sum_covered/sum_total.
-    
-    Rule: sum_covered must always be <= sum_total
-    If sum_covered > sum_total, they are automatically swapped.
-    
-    Returns: counts of corrections made and total records checked.
-    """
-    try:
-        result = database.validate_and_fix_sgbxi_amounts()
-        return {
-            "status": "success",
-            "corrected_count": result['corrected_count'],
-            "total_checked": result['total_checked'],
-            "message": f"Corrected {result['corrected_count']} out of {result['total_checked']} SGBXI records"
-        }
-    except Exception as e:
-        logger.error(f"/validate_sgbxi_amounts error:\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+def validate_sgbxi_amounts():
+    raise HTTPException(status_code=409, detail="Review invalid import records by import ID; global historical repair is disabled")

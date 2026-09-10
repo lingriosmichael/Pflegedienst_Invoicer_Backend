@@ -87,3 +87,5 @@ build/
 .coverage
 htmlcov/
 .ruff_cache/
+
+cleanup_backups/

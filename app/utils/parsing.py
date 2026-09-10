@@ -4,6 +4,7 @@ Handles conversion between German decimal format (1.234,56) and float/string rep
 """
 
 import logging
+import math
 from typing import Union
 
 logger = logging.getLogger(__name__)
@@ -37,16 +38,18 @@ class GermanDecimalParser:
             123.45
         """
         if isinstance(val, (int, float)):
-            return float(val)
+            result = float(val)
+            if not math.isfinite(result) or result < 0:
+                raise ValueError("Amount must be finite and nonnegative")
+            return result
         
         if not isinstance(val, str):
-            logger.warning(f"Unexpected type for parsing: {type(val)}. Returning 0.0")
-            return 0.0
+            raise ValueError("Amount must be a number or monetary string")
         
         val = val.strip()
         
         if not val:
-            return 0.0
+            raise ValueError("Amount is required")
 
         if '.' in val and ',' in val:
             # German format: "1.234,56" -> "1234.56"
@@ -59,8 +62,7 @@ class GermanDecimalParser:
         try:
             return float(val)
         except ValueError:
-            logger.warning(f"Failed to parse '{val}' as float. Returning 0.0")
-            return 0.0
+            raise ValueError("Invalid monetary amount") from None
 
     @staticmethod
     def to_german_string(val: Union[str, int, float], decimal_places: int = 2) -> str:

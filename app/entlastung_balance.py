@@ -15,6 +15,8 @@ from typing import Optional, Dict, Any
 
 from app.db.mongodb_config import get_database
 from app.db import DEFAULT_ORG_ID
+from app.db.transactions import transactional
+from app.utils.validation import validate_month, money
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +27,11 @@ MONTHLY_CREDIT = 131.00
 
 # First month billed under the new balance-based logic. Everything before this
 # stays on the old per-event cap / yearly-cumulative rules, untouched.
-GO_LIVE_MONTH = "082026"
+GO_LIVE_MONTH = "072026"
 
 # Last month under the old rules; the 2026 bucket is seeded with this many
-# months of accrual (Jan-Jul) and this much historical usage.
-SEED_THROUGH_MONTH = "072026"
+# months of accrual (Jan-Jun) and this much historical usage.
+SEED_THROUGH_MONTH = "062026"
 
 # Cap used by the old per-event rule, needed to reconstruct historical usage
 # for months before GO_LIVE_MONTH when seeding a bucket's used_amount.
@@ -37,7 +39,7 @@ LEGACY_COVERAGE_CAP = 127.35
 
 
 def _month_num(mmYYYY: str) -> int:
-    return int(mmYYYY[:2])
+    return int(validate_month(mmYYYY)[:2])
 
 
 def _entitlement_year(mmYYYY: str) -> int:
@@ -93,6 +95,7 @@ def _create_balance_row(
     return doc
 
 
+@transactional
 def ensure_entlastung_credit_through(patient_id: str, target_month: str) -> Dict[str, Any]:
     """
     Make sure the patient's bucket for target_month's entitlement year has been
@@ -106,8 +109,14 @@ def ensure_entlastung_credit_through(patient_id: str, target_month: str) -> Dict
     row = get_balance(patient_id, year)
 
     if row is None:
-        row = _create_balance_row(patient_id, year, credited_through_month=None,
-                                   accrued_amount=0.0, used_amount=0.0)
+        if year == 2026 and _month_num(target_month) >= 7:
+            months = [f"{month:02d}2026" for month in range(1, 7)]
+            events = db.care_events.find({"org_id": DEFAULT_ORG_ID, "patient_id": patient_id,
+                                         "event_type": "Entleistung", "invoicing_month": {"$in": months}})
+            used = sum(min(money(event.get("sum_total", 0)), LEGACY_COVERAGE_CAP) for event in events)
+            row = _create_balance_row(patient_id, year, "062026", 786.0, used)
+        else:
+            row = _create_balance_row(patient_id, year, None, 0.0, 0.0)
 
     credited_month_num = _month_num(row["credited_through_month"]) if row.get("credited_through_month") else 0
     target_month_num = _month_num(target_month)
@@ -138,6 +147,7 @@ def ensure_entlastung_credit_through(patient_id: str, target_month: str) -> Dict
     return updated
 
 
+@transactional
 def apply_entlastung_usage(patient_id: str, invoicing_month: str, sum_total: float) -> Dict[str, float]:
     """
     Consume balance for one Entlastungsleistung event. Always mutates the
@@ -151,6 +161,7 @@ def apply_entlastung_usage(patient_id: str, invoicing_month: str, sum_total: flo
     year = _entitlement_year(invoicing_month)
     row = get_balance(patient_id, year)
 
+    sum_total = money(sum_total)
     remaining = max(0.0, row["remaining_amount"])
     covered = round(min(sum_total, remaining), 2)
     owed = round(sum_total - covered, 2)
@@ -165,8 +176,10 @@ def apply_entlastung_usage(patient_id: str, invoicing_month: str, sum_total: flo
     return {"covered": covered, "owed": owed}
 
 
+@transactional
 def reverse_entlastung_usage(patient_id: str, invoicing_month: str, previously_covered: float) -> None:
     """Undo a previous apply_entlastung_usage() call, before recomputing an edited event."""
+    previously_covered = money(previously_covered)
     if not previously_covered:
         return
     db = get_database()
@@ -180,6 +193,7 @@ def reverse_entlastung_usage(patient_id: str, invoicing_month: str, previously_c
     )
 
 
+@transactional
 def recompute_entlastung_for_care_event(
     patient_id: str, invoicing_month: str, new_sum_total: float, previously_covered: float
 ) -> Dict[str, float]:
@@ -188,6 +202,7 @@ def recompute_entlastung_for_care_event(
     return apply_entlastung_usage(patient_id, invoicing_month, new_sum_total)
 
 
+@transactional
 def seed_entlastung_2026_balances(through_month: str = SEED_THROUGH_MONTH) -> Dict[str, int]:
     """
     Create the 2026 bucket for every patient that doesn't already have one,

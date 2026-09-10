@@ -1,0 +1,386 @@
+{
+  "patient_profiles": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": [
+        "org_id",
+        "patient_id",
+        "patient_name",
+        "insurance_number"
+      ],
+      "properties": {
+        "org_id": {
+          "bsonType": [
+            "string",
+            "int",
+            "long"
+          ]
+        },
+        "patient_id": {
+          "bsonType": [
+            "string",
+            "int",
+            "long"
+          ]
+        },
+        "include_service_packet": {
+          "bsonType": [
+            "bool",
+            "int",
+            "long"
+          ]
+        }
+      }
+    }
+  },
+  "care_events": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": [
+        "org_id",
+        "care_event_id",
+        "patient_id",
+        "event_type"
+      ],
+      "properties": {
+        "org_id": {
+          "bsonType": [
+            "string",
+            "int",
+            "long"
+          ]
+        },
+        "patient_id": {
+          "bsonType": [
+            "string",
+            "int",
+            "long"
+          ]
+        },
+        "care_event_id": {
+          "bsonType": "string"
+        },
+        "sum_total": {
+          "bsonType": [
+            "double",
+            "int",
+            "long",
+            "decimal"
+          ],
+          "minimum": 0
+        },
+        "sum_covered": {
+          "bsonType": [
+            "double",
+            "int",
+            "long",
+            "decimal"
+          ],
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "billing_details": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": [
+        "org_id",
+        "billing_detail_id",
+        "care_event_id"
+      ],
+      "properties": {
+        "org_id": {
+          "bsonType": [
+            "string",
+            "int",
+            "long"
+          ]
+        },
+        "invoice_number": {
+          "bsonType": [
+            "int",
+            "long",
+            "null"
+          ]
+        },
+        "sum_total": {
+          "bsonType": [
+            "double",
+            "int",
+            "long",
+            "decimal"
+          ],
+          "minimum": 0
+        },
+        "sum_covered": {
+          "bsonType": [
+            "double",
+            "int",
+            "long",
+            "decimal"
+          ],
+          "minimum": 0
+        },
+        "amount_owed": {
+          "bsonType": [
+            "double",
+            "int",
+            "long",
+            "decimal"
+          ],
+          "minimum": 0
+        },
+        "billing_status": {
+          "enum": [
+            "",
+            "invoice_needed",
+            "covered_insurance",
+            "awaiting_reconciliation",
+            "not_needed",
+            "sent",
+            "paid"
+          ]
+        }
+      }
+    }
+  },
+  "billing_summary": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": [
+        "org_id",
+        "abrechnungsmonat"
+      ],
+      "properties": {
+        "org_id": {
+          "bsonType": [
+            "string",
+            "int",
+            "long"
+          ]
+        }
+      }
+    }
+  },
+  "care_event_history": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": [
+        "org_id",
+        "action"
+      ],
+      "properties": {
+        "org_id": {
+          "bsonType": [
+            "string",
+            "int",
+            "long"
+          ]
+        }
+      }
+    }
+  },
+  "entlastung_year_balance": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": [
+        "org_id",
+        "patient_id",
+        "entitlement_year"
+      ],
+      "properties": {
+        "org_id": {
+          "bsonType": [
+            "string",
+            "int",
+            "long"
+          ]
+        },
+        "patient_id": {
+          "bsonType": [
+            "string",
+            "int",
+            "long"
+          ]
+        },
+        "accrued_amount": {
+          "bsonType": [
+            "double",
+            "int",
+            "long",
+            "decimal"
+          ],
+          "minimum": 0
+        },
+        "used_amount": {
+          "bsonType": [
+            "double",
+            "int",
+            "long",
+            "decimal"
+          ],
+          "minimum": 0
+        },
+        "remaining_amount": {
+          "bsonType": [
+            "double",
+            "int",
+            "long",
+            "decimal"
+          ],
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "invoice_sequences": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": [
+        "org_id"
+      ],
+      "properties": {
+        "org_id": {
+          "bsonType": [
+            "string",
+            "int",
+            "long"
+          ]
+        },
+        "last_number": {
+          "bsonType": [
+            "int",
+            "long"
+          ],
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "import_jobs": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": [
+        "org_id",
+        "import_id",
+        "invoicing_month",
+        "file_hash",
+        "file_name"
+      ],
+      "properties": {
+        "org_id": {
+          "bsonType": [
+            "string",
+            "int",
+            "long"
+          ]
+        }
+      }
+    }
+  },
+  "service_packet_charges": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": [
+        "org_id",
+        "patient_id",
+        "invoicing_month"
+      ],
+      "properties": {
+        "org_id": {
+          "bsonType": [
+            "string",
+            "int",
+            "long"
+          ]
+        }
+      }
+    }
+  },
+  "rzh_reconciliation_batches": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": ["org_id", "batch_id", "source_pdf_hash", "source_file_name", "parse_status"],
+      "properties": {
+        "org_id": {"bsonType": ["string", "int", "long"]},
+        "batch_id": {"bsonType": "string"},
+        "source_pdf_hash": {"bsonType": "string"},
+        "source_file_name": {"bsonType": "string"},
+        "parse_status": {"enum": ["registered", "parsed", "incomplete", "failed"]}
+      }
+    }
+  },
+  "rzh_reconciliation_items": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": ["org_id", "reconciliation_item_id", "item_fingerprint", "reason_code", "match_status", "apply_status"],
+      "properties": {
+        "org_id": {"bsonType": ["string", "int", "long"]},
+        "reconciliation_item_id": {"bsonType": "string"},
+        "item_fingerprint": {"bsonType": "string"},
+        "reason_code": {"bsonType": "string"},
+        "match_status": {"enum": ["unmatched", "matched", "ambiguous", "manual_review"]},
+        "apply_status": {"enum": ["not_applied", "proposed", "reviewed", "applied", "superseded", "dismissed"]}
+      }
+    }
+  },
+  "entlastung_opening_snapshots": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": ["org_id", "patient_id", "entitlement_year", "opening_as_of", "opening_locked", "opening_logic_version", "opening_accrued_amount", "opening_used_amount", "opening_remaining_amount", "historical_excess_usage"],
+      "properties": {
+        "org_id": {"bsonType": ["string", "int", "long"]},
+        "patient_id": {"bsonType": ["string", "int", "long"]},
+        "entitlement_year": {"bsonType": "int"},
+        "opening_locked": {"bsonType": "bool"},
+        "opening_remaining_amount": {"bsonType": ["double", "int", "long", "decimal"], "minimum": 0},
+        "historical_excess_usage": {"bsonType": ["double", "int", "long", "decimal"], "minimum": 0}
+      }
+    }
+  },
+  "entlastung_balance_adjustments": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": ["org_id", "adjustment_id", "patient_id", "entitlement_year", "amount_cents", "adjustment_type", "care_event_id", "reconciliation_item_id"],
+      "properties": {
+        "org_id": {"bsonType": ["string", "int", "long"]},
+        "adjustment_id": {"bsonType": "string"},
+        "patient_id": {"bsonType": ["string", "int", "long"]},
+        "entitlement_year": {"bsonType": "int"},
+        "amount_cents": {"bsonType": ["int", "long"]},
+        "adjustment_type": {"enum": ["rzh_checkpoint"]},
+        "active": {"bsonType": "bool"}
+      }
+    }
+  },
+  "entlastung_replay_runs": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": ["org_id", "replay_run_id", "patient_id", "entitlement_year", "trigger_item_id"],
+      "properties": {
+        "org_id": {"bsonType": ["string", "int", "long"]},
+        "replay_run_id": {"bsonType": "string"},
+        "patient_id": {"bsonType": ["string", "int", "long"]},
+        "entitlement_year": {"bsonType": "int"}
+      }
+    }
+  },
+  "schema_migrations": {
+    "$jsonSchema": {
+      "bsonType": "object",
+      "required": [
+        "version"
+      ],
+      "properties": {
+        "org_id": {
+          "bsonType": [
+            "string",
+            "int",
+            "long"
+          ]
+        }
+      }
+    }
+  }
+}

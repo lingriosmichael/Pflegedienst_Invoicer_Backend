@@ -47,7 +47,7 @@ def _seed_row(db, patient_id, year, credited_through_month, accrued, used):
     })
 
 
-def test_new_logic_month_fully_covered_creates_no_owed_row(db):
+def test_entlastung_is_presumed_covered_and_does_not_consume_reference_balance(db):
     _seed_row(db, "pat_1", 2026, "072026", accrued=917.0, used=0.0)
     _make_care_event(db, "pat_1", "082026", sum_total=90.0)
 
@@ -59,24 +59,37 @@ def test_new_logic_month_fully_covered_creates_no_owed_row(db):
     assert bd["sum_covered"] == pytest.approx(90.0)
     assert bd["amount_owed"] == pytest.approx(0.0)
     balance = eb.get_balance("pat_1", 2026)
-    assert balance["used_amount"] == pytest.approx(90.0)
+    assert balance["used_amount"] == pytest.approx(0.0)
+    assert bd["reconciliation_status"] == "assumed_covered_until_rzh"
+    assert bd["coverage_source"] == "assumed_full_until_rzh"
 
 
-def test_new_logic_month_partially_covered_creates_invoice_needed_row(db):
-    # 67 left before August; August's own 131 credit is added first (per the
-    # coverage algorithm), so 67 + 131 = 198 is available before the 200 is drawn.
+def test_entlastung_never_becomes_invoice_needed_from_allowance_reference(db):
     _seed_row(db, "pat_1", 2026, "072026", accrued=917.0, used=850.0)
     _make_care_event(db, "pat_1", "082026", sum_total=200.0)
 
     database.mark_month_ready_for_generation("082026")
 
     bd = db.billing_details.find_one({"org_id": ORG})
-    assert bd["billing_status"] == "invoice_needed"
-    assert bd["sum_covered"] == pytest.approx(198.0)
-    assert bd["amount_owed"] == pytest.approx(2.0)
+    assert bd["billing_status"] == "covered_insurance"
+    assert bd["sum_covered"] == pytest.approx(200.0)
+    assert bd["amount_owed"] == pytest.approx(0.0)
+    assert eb.get_balance("pat_1", 2026)["used_amount"] == pytest.approx(850.0)
 
 
-def test_rerunning_mark_ready_same_month_does_not_double_consume_balance(db):
+def test_entlastung_is_presumed_covered_regardless_of_month_or_reference_balance(db):
+    _seed_row(db, "pat_1", 2026, "072026", accrued=917.0, used=850.0)
+    _make_care_event(db, "pat_1", "082026", sum_total=200.0)
+
+    database.mark_month_ready_for_generation("082026")
+
+    bill = db.billing_details.find_one({"org_id": ORG})
+    assert bill["billing_status"] == "covered_insurance"
+    assert bill["reconciliation_status"] == "assumed_covered_until_rzh"
+    assert bill["sum_covered"] == pytest.approx(200.0)
+
+
+def test_rerunning_entlastung_marker_does_not_change_reference_balance(db):
     _seed_row(db, "pat_1", 2026, "072026", accrued=917.0, used=0.0)
     _make_care_event(db, "pat_1", "082026", sum_total=90.0)
 
@@ -85,18 +98,18 @@ def test_rerunning_mark_ready_same_month_does_not_double_consume_balance(db):
 
     assert created_second_run == 0  # already has billing_details, skipped
     balance = eb.get_balance("pat_1", 2026)
-    assert balance["used_amount"] == pytest.approx(90.0)  # not 180.0
+    assert balance["used_amount"] == pytest.approx(0.0)
     assert db.billing_details.count_documents({"org_id": ORG}) == 1
 
 
-def test_old_month_still_uses_legacy_cap_untouched(db):
-    _make_care_event(db, "pat_1", "072026", sum_total=200.0)
+def test_historic_entlastung_is_also_presumed_covered_until_rzh_confirms(db):
+    _make_care_event(db, "pat_1", "062026", sum_total=200.0)
 
-    database.mark_month_ready_for_generation("072026", legacy_entleistung=True)
+    database.mark_month_ready_for_generation("062026")
 
     bd = db.billing_details.find_one({"org_id": ORG})
-    assert bd["sum_covered"] == pytest.approx(127.35)
-    assert bd["amount_owed"] == pytest.approx(200.0 - 127.35)
-    assert bd["billing_status"] == "invoice_needed"
-    # old months must never touch the new balance collection
+    assert bd["sum_covered"] == pytest.approx(200.0)
+    assert bd["amount_owed"] == pytest.approx(0.0)
+    assert bd["billing_status"] == "covered_insurance"
+    # historic months also never touch the reference balance collection
     assert eb.get_balance("pat_1", 2026) is None

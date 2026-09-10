@@ -40,23 +40,7 @@ def make_cache_key(model: str, system_prompt: str, user_text: str) -> str:
 
 
 def cache_failed_request(model: str, system_prompt: str, user_text: str, error: str):
-    """Cache a failed request for troubleshooting."""
-    path = _failure_cache_path(model, system_prompt, user_text)
-    try:
-        failure_data = {
-            "timestamp": datetime.now().isoformat(),
-            "model": model,
-            "error": error,
-            "input": {
-                "system_prompt": system_prompt,
-                "user_text": user_text
-            }
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(failure_data, f, ensure_ascii=False, indent=2)
-        logger.info(f"✓ Cached failed request: {path}")
-    except Exception as e:
-        logger.warning(f"Failed to cache error: {e}")
+    logger.warning("Extraction failed; retry through the identified import job")
 
 
 def count_tokens(text: str, model: str = "gpt-5-mini-2025-08-07") -> int:

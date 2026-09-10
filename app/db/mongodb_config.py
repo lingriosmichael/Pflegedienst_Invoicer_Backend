@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 from pymongo.server_api import ServerApi
+from app.db.transactions import bind_session
 
 # This module reads MONGODB_URI at import time, which can happen before any
 # other module has loaded .env (import order across app/ is not guaranteed).
@@ -26,6 +27,13 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 MONGODB_URI = os.getenv("MONGODB_URI")
+if os.getenv("MONGODB_HOST"):
+    from urllib.parse import quote
+    username = quote(os.environ["MONGO_APP_USER"], safe="")
+    password = quote(os.environ["MONGO_APP_PASSWORD"], safe="")
+    database_name = quote(os.getenv("MONGODB_DB_NAME", "pflegedienst_db"), safe="")
+    mongo_host = os.environ["MONGODB_HOST"]
+    MONGODB_URI = f"mongodb://{username}:{password}@{mongo_host}/{database_name}?authSource=admin&replicaSet=rs0&directConnection=true"
 if not MONGODB_URI:
     raise RuntimeError(
         "MONGODB_URI environment variable must be set (no insecure default is provided). "
@@ -118,7 +126,7 @@ def get_database():
     global _database
     
     if _database is not None:
-        return _database
+        return bind_session(_database)
     
     client = _get_client()
     _database = client[MONGODB_DB_NAME]
@@ -126,7 +134,7 @@ def get_database():
     if DB_DEBUG_LOG:
         logger.debug(f"Using database: {MONGODB_DB_NAME}")
     
-    return _database
+    return bind_session(_database)
 
 
 def get_client():

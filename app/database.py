@@ -8,7 +8,9 @@ All functions maintain backward-compatible interfaces while using MongoDB reposi
 """
 
 import logging
-from datetime import datetime
+from app.db.transactions import transactional
+from app.utils.validation import validate_month, money, parse_service_date
+from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
 from app.db.mongodb_config import get_database
 from app.utils.parsing import GermanDecimalParser, generate_id
@@ -24,7 +26,6 @@ from app.db import (
     DEFAULT_ORG_ID,
 )
 from app.utils.data_validation import DataNormalizer, DataValidationError
-from app.entlastung_balance import uses_new_entlastung_logic, apply_entlastung_usage
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +91,8 @@ def _resolve_invoice_amounts(event_type: str, ce: Dict[str, Any], bd: Optional[D
     bd_amount_owed = float(bd_amount_owed_raw or 0)
     investitionskosten = float(bd.get("investitionskosten", 0) or 0)
 
-    sum_total = ce_sum_total if ce_sum_total > 0 else bd_sum_total
-    sum_covered = ce_sum_covered if ce_sum_covered > 0 else bd_sum_covered
+    sum_total = bd_sum_total if "sum_total" in bd else ce_sum_total
+    sum_covered = bd_sum_covered if "sum_covered" in bd else ce_sum_covered
     amount_owed = bd_amount_owed
 
     if event_type == "SGBXI":
@@ -153,7 +154,7 @@ def insert_billing_summary(data: Dict, abrechnungsmonat: str) -> Optional[str]:
         return summary_id
         
     except Exception as e:
-        logger.error(f"Error inserting billing summary: {e}")
+        logger.error("Operation failed (%s)", type(e).__name__)
         return None
 
 
@@ -194,7 +195,7 @@ def record_file_import(filename: str, abrechnungsmonat: str, import_mode: str,
         return True
         
     except Exception as e:
-        logger.error(f"Error recording file import: {e}")
+        logger.error("Operation failed (%s)", type(e).__name__)
         return False
 
 
@@ -202,289 +203,15 @@ def record_file_import(filename: str, abrechnungsmonat: str, import_mode: str,
 # Structured Data Insertion (PDF Import)
 # ============================================================================
 
-def insert_structured_data(data: Dict, origin_chunk_id: Optional[str] = None, 
-                           invoicing_month: Optional[str] = None) -> Optional[str]:
-    """
-    Insert invoice data into MongoDB.
-    Maps to: patient_profiles, care_events (with embedded services)
-    
-    Args:
-        data: Structured invoice data with patient, invoice, services keys
-        origin_chunk_id: Optional chunk ID for tracking
-        invoicing_month: Billing month (MMYYYY format)
-        
-    Returns:
-        care_event_id on success, None on error
-    """
-    try:
-        db = get_database()
-        
-        patient = data["patient"]
-        invoice = data["invoice"]
-        services = data["services"]
-
-        if "care_account" not in invoice:
-            invoice["care_account"] = patient.get("pflege_konto", "")
-
-        # Normalize birthdate
-        try:
-            patient["birthdate"] = DataNormalizer.normalize_birthdate(patient.get("birthdate", ""))
-        except DataValidationError as e:
-            logger.error(f"❌ Failed to normalize birthdate for patient {patient.get('name', '[unknown]')}: {e}")
-            return None
-
-        # Normalize invoice amounts
-        try:
-            covered_float = float(DataNormalizer.normalize_amount(invoice.get("summe_covered", "0")))
-            total_float = float(DataNormalizer.normalize_amount(invoice.get("summe_total", "0")))
-            invoice["summe_covered"] = covered_float
-            invoice["summe_total"] = total_float
-        except DataValidationError as e:
-            logger.error(f"❌ Failed to normalize invoice amounts for patient {patient.get('name', '[unknown]')}: {e}")
-            return None
-
-        amount_owed = total_float - covered_float
-
-        # Normalize service amounts
-        normalized_services = []
-        for s in services:
-            try:
-                unit_price = DataNormalizer.normalize_amount(s.get("unit_price", "0"))
-                total_price = DataNormalizer.normalize_amount(s.get("total_price", "0"))
-                quantity_str = str(s.get("quantity", "0")).strip().replace(',', '.')
-                
-                normalized_services.append({
-                    "service_code": s.get("code", ""),
-                    "service_description": s.get("description", ""),
-                    "quantity_value": float(quantity_str) if quantity_str else 0,
-                    "unit_price": float(unit_price),
-                    "line_total": float(total_price)
-                })
-            except (DataValidationError, ValueError) as e:
-                logger.warning(f"Failed to normalize service: {e}")
-
-        # Generate IDs
-        care_event_id = generate_id("evt")
-        
-        # Check if patient exists by insurance_number
-        existing_patient = db.patient_profiles.find_one({
-            "org_id": DEFAULT_ORG_ID,
-            "insurance_number": patient.get("insurance_number")
-        })
-        
-        if existing_patient:
-            patient_id = existing_patient["patient_id"]
-            # Update patient with new data
-            update_fields = {
-                "patient_name": patient.get("name"),
-                "date_of_birth": patient.get("birthdate"),
-                "updated_at": datetime.utcnow()
-            }
-            if patient.get("care_level"):
-                update_fields["care_level"] = patient.get("care_level")
-            
-            db.patient_profiles.update_one(
-                {"patient_id": patient_id, "org_id": DEFAULT_ORG_ID},
-                {"$set": update_fields}
-            )
-        else:
-            # Create new patient
-            patient_id = generate_id("pat")
-            patient_doc = {
-                "patient_id": patient_id,
-                "org_id": DEFAULT_ORG_ID,
-                "patient_name": patient.get("name"),
-                "date_of_birth": patient.get("birthdate"),
-                "insurance_number": patient.get("insurance_number"),
-                "care_level": patient.get("care_level"),
-                "include_service_packet": int(bool(patient.get("include_service_packet", 0))),
-                "created_at": datetime.utcnow()
-            }
-            db.patient_profiles.insert_one(patient_doc)
-
-        # Determine event_type based on care_account
-        care_account = invoice.get("care_account", "")
-        if care_account == "4062":
-            event_type = "Consultation"
-        elif care_account == "4064":
-            event_type = "Entleistung"
-        elif care_account == "4050":
-            event_type = "Verhinderungspflege"
-        elif care_account in ["4010", "4020", "4030", "4040"]:
-            event_type = "SGBXI"
-        else:
-            event_type = "SGBV"
-
-        logger.info(f"→ Inserting care_event for {patient.get('name')} "
-                   f"(insurance: {patient.get('insurance_number')}, care_account: {care_account}, event_type: {event_type})")
-
-        # Create care_event with embedded services
-        care_event_doc = {
-            "care_event_id": care_event_id,
-            "org_id": DEFAULT_ORG_ID,
-            "patient_id": patient_id,
-            "event_type": event_type,
-            "period_start_date": invoice.get("pflegezeitraum_beginn"),
-            "period_end_date": invoice.get("pflegezeitraum_ende"),
-            "care_account": care_account,
-            "sum_covered": covered_float,
-            "sum_total": total_float,
-            "invoicing_month": invoicing_month,
-            "services": normalized_services,
-            "origin_chunk_id": origin_chunk_id,
-            "created_at": datetime.utcnow()
-        }
-        db.care_events.insert_one(care_event_doc)
-
-        # Create history record
-        history_doc = {
-            "history_id": generate_id("hist"),
-            "org_id": DEFAULT_ORG_ID,
-            "care_event_id": care_event_id,
-            "action": "created",
-            "created_at": datetime.utcnow()
-        }
-        db.care_event_history.insert_one(history_doc)
-
-        logger.info(f"✓ Care event inserted: {care_event_id}, type={event_type}, patient={patient.get('name')}")
-        return care_event_id
-
-    except Exception as e:
-        logger.error(f"Error inserting structured data: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return None
+def insert_structured_data(data, origin_chunk_id=None, invoicing_month=None):
+    from app.import_records import persist_record
+    return persist_record(data, origin_chunk_id, invoicing_month)
 
 
-def insert_care_record(data: Dict, record_type: str, pflegekonto: str, 
-                       origin_chunk_id: Optional[str] = None) -> Optional[str]:
-    """
-    Insert a non-billable care record (SGBV, Verhinderungspflege).
-    
-    Args:
-        data: Dictionary with patient, services, invoice keys
-        record_type: 'SGBV' or 'Verhinderungspflege'
-        pflegekonto: Care account code (4092 or 4050)
-        origin_chunk_id: Optional chunk ID for traceability
-        
-    Returns:
-        care_event_id on success, None on error
-    """
-    try:
-        db = get_database()
-        
-        patient = data.get("patient", {})
-        invoice = data.get("invoice", {})
-        services = data.get("services", [])
-        
-        # Normalize birthdate
-        try:
-            patient["birthdate"] = DataNormalizer.normalize_birthdate(patient.get("birthdate", ""))
-        except DataValidationError as e:
-            logger.error(f"Failed to normalize birthdate: {e}")
-            return None
-        
-        # Normalize service amounts
-        normalized_services = []
-        for service in services:
-            try:
-                unit_price = float(DataNormalizer.normalize_amount(service.get("unit_price", "0")))
-                total_price = float(DataNormalizer.normalize_amount(service.get("total_price", "0")))
-                quantity_str = str(service.get("quantity", "0")).strip().replace(',', '.')
-                
-                normalized_services.append({
-                    "service_code": service.get("code", ""),
-                    "service_description": service.get("description", ""),
-                    "quantity_value": float(quantity_str) if quantity_str else 0,
-                    "unit_price": unit_price,
-                    "line_total": total_price
-                })
-            except (DataValidationError, ValueError) as e:
-                logger.warning(f"Failed to normalize service in care record: {e}")
-        
-        # Check if patient exists
-        existing_patient = db.patient_profiles.find_one({
-            "org_id": DEFAULT_ORG_ID,
-            "insurance_number": patient.get("insurance_number")
-        })
-        
-        if existing_patient:
-            patient_id = existing_patient["patient_id"]
-            update_fields = {
-                "patient_name": patient.get("name"),
-                "date_of_birth": patient.get("birthdate"),
-                "updated_at": datetime.utcnow()
-            }
-            if patient.get("care_level"):
-                update_fields["care_level"] = patient.get("care_level")
-            
-            db.patient_profiles.update_one(
-                {"patient_id": patient_id, "org_id": DEFAULT_ORG_ID},
-                {"$set": update_fields}
-            )
-        else:
-            patient_id = generate_id("pat")
-            patient_doc = {
-                "patient_id": patient_id,
-                "org_id": DEFAULT_ORG_ID,
-                "patient_name": patient.get("name"),
-                "date_of_birth": patient.get("birthdate"),
-                "insurance_number": patient.get("insurance_number"),
-                "care_level": patient.get("care_level"),
-                "created_at": datetime.utcnow()
-            }
-            db.patient_profiles.insert_one(patient_doc)
-        
-        # Normalize invoice amounts
-        try:
-            covered_float = float(DataNormalizer.normalize_amount(invoice.get("summe_covered", "0")))
-            total_float = float(DataNormalizer.normalize_amount(invoice.get("summe_total", "0")))
-        except DataValidationError:
-            covered_float = 0.0
-            total_float = 0.0
-        
-        # Create care event
-        care_event_id = generate_id("evt")
-        care_event_doc = {
-            "care_event_id": care_event_id,
-            "org_id": DEFAULT_ORG_ID,
-            "patient_id": patient_id,
-            "event_type": record_type,
-            "period_start_date": invoice.get("pflegezeitraum_beginn"),
-            "period_end_date": invoice.get("pflegezeitraum_ende"),
-            "care_account": pflegekonto,
-            "sum_covered": covered_float,
-            "sum_total": total_float,
-            "services": normalized_services,
-            "origin_chunk_id": origin_chunk_id,
-            "created_at": datetime.utcnow()
-        }
-        db.care_events.insert_one(care_event_doc)
-        
-        # Create history record
-        history_doc = {
-            "history_id": generate_id("hist"),
-            "org_id": DEFAULT_ORG_ID,
-            "care_event_id": care_event_id,
-            "action": "created",
-            "created_at": datetime.utcnow()
-        }
-        db.care_event_history.insert_one(history_doc)
-        
-        logger.info(f"✓ Care event inserted: {care_event_id}, type={record_type}, "
-                   f"patient={patient.get('name')}, services={len(normalized_services)}")
-        return care_event_id
+def insert_care_record(data, record_type, pflegekonto, origin_chunk_id=None, invoicing_month=None):
+    from app.import_records import persist_record
+    return persist_record(data, origin_chunk_id, invoicing_month, record_type, pflegekonto)
 
-    except Exception as e:
-        logger.error(f"Error inserting care record: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return None
-
-
-# ============================================================================
-# Invoice Generation Functions
-# ============================================================================
 
 def get_private_invoice_cases(
     invoicing_month: Optional[str] = None,
@@ -512,7 +239,7 @@ def get_private_invoice_cases(
             ce = db.care_events.find_one({
                 "org_id": DEFAULT_ORG_ID,
                 "care_event_id": invoice_id,
-                "event_type": {"$in": ["SGBXI", "Entleistung"]}
+                "event_type": {"$in": ["SGBXI", "Entleistung", "ServicePacket"]}
             })
             
             if not ce:
@@ -558,7 +285,7 @@ def get_private_invoice_cases(
                                         "$and": [
                                             {"$eq": ["$care_event_id", "$$ce_id"]},
                                             {"$eq": ["$org_id", DEFAULT_ORG_ID]},
-                                            {"$in": ["$event_type", ["SGBXI", "Entleistung"]]}
+                                            {"$in": ["$event_type", ["SGBXI", "Entleistung", "ServicePacket"]]}
                                         ]
                                     }
                                 }
@@ -616,9 +343,9 @@ def get_private_invoice_cases(
         return cases
         
     except Exception as e:
-        logger.error(f"Error getting private invoice cases: {e}")
+        logger.error("Operation failed (%s)", type(e).__name__)
         import traceback
-        logger.error(traceback.format_exc())
+        logger.error("Operation failed; transaction will be rolled back")
         return []
 
 
@@ -647,6 +374,8 @@ def _build_invoice_case(ce: Dict, bd: Optional[Dict], patient: Dict) -> Optional
             "invoicing_month": bd.get("invoicing_month") or ce.get("invoicing_month"),
             "invoice_number": bd.get("invoice_number"),
             "amount_owed": amounts["amount_owed"],
+            "investitionskosten": bd.get("investitionskosten", 0),
+            "invoice_total": round(amounts["amount_owed"] + bd.get("service_packet_amount", 0), 2),
             "sum_covered": amounts["sum_covered"],
             "sum_total": amounts["sum_total"],
             "care_range_begin": ce.get("period_start_date"),
@@ -660,7 +389,7 @@ def _build_invoice_case(ce: Dict, bd: Optional[Dict], patient: Dict) -> Optional
             "insurance_number": patient.get("insurance_number"),
             "birthdate": patient.get("date_of_birth"),
             "care_level": patient.get("care_level"),
-            "include_service_packet": patient.get("include_service_packet", 0) if event_type == "SGBXI" else 0,
+            "include_service_packet": bool(bd.get("service_packet_amount", 0)) if event_type == "SGBXI" else False,
             "address": address,
             "debtor_number": patient.get("debtor_id")
         },
@@ -749,7 +478,7 @@ def get_orphaned_service_packet_cases(invoicing_month: str) -> List[Dict]:
         return cases
         
     except Exception as e:
-        logger.error(f"Error getting orphaned service packet cases: {e}")
+        logger.error("Operation failed (%s)", type(e).__name__)
         return []
 
 
@@ -774,7 +503,7 @@ def check_missing_patient_fields(invoicing_month: str, auto_fix: bool = False) -
                 "$match": {
                     "org_id": DEFAULT_ORG_ID,
                     "invoicing_month": invoicing_month,
-                    "event_type": {"$in": ["SGBXI", "Entleistung"]}
+                    "event_type": {"$in": ["SGBXI", "Entleistung", "ServicePacket"]}
                 }
             },
             {
@@ -808,7 +537,7 @@ def check_missing_patient_fields(invoicing_month: str, auto_fix: bool = False) -
             patient_id = patient.get("patient_id")
             name = patient.get("patient_name")
             
-            logger.warning(f"Patient '{name}' ({patient.get('insurance_number')}) is missing address fields.")
+            logger.warning("Patient %s has incomplete address fields", patient_id)
             
             if auto_fix:
                 update_fields = {}
@@ -827,7 +556,7 @@ def check_missing_patient_fields(invoicing_month: str, auto_fix: bool = False) -
                         {"patient_id": patient_id, "org_id": DEFAULT_ORG_ID},
                         {"$set": update_fields}
                     )
-                    logger.info(f"Patient {name}: auto-fixed with placeholder values.")
+                    logger.info("Patient %s has incomplete address fields", patient_id)
             else:
                 logger.warning(f"  - Street Name: {'MISSING' if not patient.get('street_name') else 'OK'}")
                 logger.warning(f"  - Street Number: {'MISSING' if not patient.get('street_number') else 'OK'}")
@@ -835,7 +564,7 @@ def check_missing_patient_fields(invoicing_month: str, auto_fix: bool = False) -
                 logger.warning(f"  - City: {'MISSING' if not patient.get('city') else 'OK'}")
                 
     except Exception as e:
-        logger.error(f"Error checking missing patient fields: {e}")
+        logger.error("Operation failed (%s)", type(e).__name__)
 
 
 def check_service_fields(auto_fix: bool = False) -> None:
@@ -854,6 +583,9 @@ def check_service_fields(auto_fix: bool = False) -> None:
             "services": {"$exists": True, "$ne": []}
         })
         
+        care_events.sort(key=lambda event: (
+            str(event.get("patient_id")), parse_service_date(event.get("period_start_date") or f"01.{invoicing_month[:2]}.{invoicing_month[2:]}"),
+            str(event.get("care_event_id"))))
         for ce in care_events:
             care_event_id = ce.get("care_event_id")
             services = ce.get("services", [])
@@ -906,39 +638,44 @@ def check_service_fields(auto_fix: bool = False) -> None:
                 )
                 
     except Exception as e:
-        logger.error(f"Error checking service fields: {e}")
+        logger.error("Operation failed (%s)", type(e).__name__)
 
 
 # ============================================================================
 # Billing Functions
 # ============================================================================
 
-def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = False, 
-                                     legacy_entleistung: bool = False) -> int:
+@transactional
+def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = False,
+                                     event_types: Optional[List[str]] = None) -> int:
     """
     Create billing_details for care_events that need invoicing.
-    
+
     SGBXI: Always create billing_details (for investitionskosten)
-    Entleistung: Create if sum_total > 127.35 EUR (legacy) or cumulative > 1500 EUR/year (new)
-    SGBV/Verhinderungspflege/Consultation: Never create (non-billable)
-    
+    Entleistung: Creates a covered-insurance audit marker. RZH is the only
+    authority that can later change that one claim to a private invoice.
+    SGBV/Verhinderungspflege: Create a not_needed audit marker (non-billable)
+
     Args:
         invoicing_month: Month to process (MMYYYY format)
         only_positive: If True, only create for positive amounts
-        legacy_entleistung: If True, use simple monthly threshold logic
-        
+
     Returns:
         Number of billing_details rows created
     """
+    validate_month(invoicing_month)
     try:
         db = get_database()
         billing_rows_created = 0
         
-        # Find billable care_events without billing_details
+        # The normal invoice workflow must be explicitly scoped to SGB XI.
+        # Entlastungsleistung remains importable, but is handled solely by
+        # RZH reconciliation and its individual issue action.
+        billable_types = event_types or ["SGBXI", "Entleistung", "ServicePacket"]
         care_events = list(db.care_events.find({
             "org_id": DEFAULT_ORG_ID,
             "invoicing_month": invoicing_month,
-            "event_type": {"$in": ["SGBXI", "Entleistung"]}
+            "event_type": {"$in": billable_types}
         }))
         
         # Get existing billing_details for this month
@@ -966,29 +703,27 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
             if care_event_id in existing_billings:
                 continue
             
-            sum_covered = ce.get("sum_covered", 0) or 0
-            sum_total = ce.get("sum_total", 0) or 0
+            sum_covered = money(ce.get("sum_covered", 0) or 0)
+            sum_total = money(ce.get("sum_total", 0) or 0)
             
             # Calculate investitionskosten (6% for SGBXI only)
             investitionskosten = 0.0
             if event_type == "SGBXI":
-                investitionskosten = sum_total * 0.06
+                investitionskosten = money(sum_total * 0.06)
             
-            # Entleistung special handling
-            entlastung_new_logic = event_type == "Entleistung" and uses_new_entlastung_logic(invoicing_month)
-
-            if entlastung_new_logic:
-                # Balance-based coverage (from 082026 onward): consume the patient's
-                # year-bucket balance regardless of whether an invoice ends up needed.
-                usage = apply_entlastung_usage(patient_id, invoicing_month, sum_total)
-                sum_covered = usage["covered"]
-                amount_owed = usage["owed"]
-            elif event_type == "Entleistung":
-                ENTLEISTUNG_CAP = 127.35
-                sum_covered = min(sum_total, ENTLEISTUNG_CAP)
-                amount_owed = sum_total - sum_covered
+            # Entlastungsleistung is RZH-authoritative. The annual balance is
+            # reference data only and must not calculate, release, or block a
+            # patient invoice.
+            if event_type == "Entleistung":
+                # A service is presumed fully covered when imported.  The
+                # source RZH statement can later replace this provisional
+                # value with its documented private amount.
+                sum_covered = sum_total
+                amount_owed = 0.0
             else:
-                amount_owed = sum_total - sum_covered + investitionskosten
+                if sum_covered > sum_total:
+                    raise ValueError("Coverage exceeds service total")
+                amount_owed = money(sum_total - sum_covered + investitionskosten)
 
             # Determine if billing should be created
             should_create = False
@@ -997,36 +732,15 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
             if event_type == "SGBXI":
                 should_create = True
                 billing_status = "invoice_needed"
-            elif entlastung_new_logic:
-                # Always persist a row so a re-run of mark_ready never re-applies
-                # the balance mutation for the same care_event twice (idempotency),
-                # and so covered-but-not-owed usage stays visible for audit/UI.
-                # Only invoice the patient privately for whatever the balance didn't cover.
-                should_create = True
-                billing_status = "invoice_needed" if amount_owed > 0 else "covered_insurance"
             elif event_type == "Entleistung":
-                if legacy_entleistung:
-                    # Legacy: simple monthly threshold
-                    if sum_total > 127.35:
-                        should_create = True
-                        billing_status = "invoice_needed"
-                else:
-                    # New (pre-082026 only): cumulative yearly limit (1500 EUR)
-                    year = int(invoicing_month[-4:]) if len(invoicing_month) >= 6 else datetime.now().year
-
-                    # Get cumulative for this patient/year
-                    existing_events = db.care_events.find({
-                        "org_id": DEFAULT_ORG_ID,
-                        "patient_id": patient_id,
-                        "event_type": "Entleistung",
-                        "invoicing_month": {"$regex": f".*{year}$"}
-                    })
-
-                    cumulative = sum(e.get("sum_total", 0) for e in existing_events)
-
-                    if cumulative > 1500.0:
-                        should_create = True
-                        billing_status = "invoice_needed"
+                # Durable RZH-matchable audit marker; never a normal invoice.
+                should_create = True
+                billing_status = "covered_insurance"
+            elif event_type in {"SGBV", "Verhinderungspflege"}:
+                # These care accounts are retained for audit/history, but are
+                # never part of the private-invoice workflow.
+                should_create = True
+                billing_status = "not_needed"
             
             if should_create:
                 billing_id = generate_id("bill")
@@ -1041,82 +755,117 @@ def mark_month_ready_for_generation(invoicing_month: str, only_positive: bool = 
                     "amount_owed": amount_owed,
                     "invoice_number": None,
                     "billing_status": billing_status,
+                    "reconciliation_status": (
+                        "assumed_covered_until_rzh" if event_type == "Entleistung" else None
+                    ),
+                    "coverage_source": (
+                        "assumed_full_until_rzh" if event_type == "Entleistung" else None
+                    ),
                     "created_at": datetime.utcnow()
                 }
                 db.billing_details.insert_one(billing_doc)
                 billing_rows_created += 1
         
-        entleistung_logic = "legacy (>127.35 EUR/month)" if legacy_entleistung else "new (yearly cumulative 1500 EUR)"
-        logger.info(f"Created {billing_rows_created} billing_details rows in {invoicing_month}: "
-                   f"SGBXI=all, Entleistung={entleistung_logic}")
+        logger.info("Created %s billing_details rows in %s", billing_rows_created, invoicing_month)
         return billing_rows_created
         
     except Exception as e:
-        logger.error(f"Error marking month ready for generation: {e}")
+        logger.error("Operation failed (%s)", type(e).__name__)
         import traceback
-        logger.error(traceback.format_exc())
-        return 0
+        logger.error("Operation failed; transaction will be rolled back")
+        raise
 
 
-def validate_and_fix_sgbxi_amounts() -> Dict[str, Any]:
+def _calendar_months_ago(value: datetime, months: int) -> datetime:
+    """Return the same wall-clock day N calendar months earlier."""
+    absolute_month = value.year * 12 + value.month - 1 - months
+    year, month_index = divmod(absolute_month, 12)
+    month = month_index + 1
+    # All imported rows have a real timestamp. Clamping protects month-end
+    # dates if this helper is reused with a different current date.
+    import calendar
+    return value.replace(year=year, month=month, day=min(value.day, calendar.monthrange(year, month)[1]))
+
+
+@transactional
+def expire_stale_entlastung_coverage(now: Optional[datetime] = None) -> int:
+    """Close unchanged Entlastungsleistung claims four calendar months after import.
+
+    An observed negative RZH correction keeps the claim open for review. A
+    later correction can still reopen a `not_needed` claim through the normal
+    RZH confirmation operation.
     """
-    Validate SGBXI care_events and auto-correct reversed sum_covered/sum_total.
+    database = get_database()
+    now = now or datetime.now(timezone.utc)
+    cutoff = _calendar_months_ago(now, 4)
+    candidates = list(database.billing_details.find({
+        "org_id": DEFAULT_ORG_ID,
+        "billing_status": "covered_insurance",
+    }))
+    changed = 0
+    for bill in candidates:
+        event = database.care_events.find_one({
+            "org_id": DEFAULT_ORG_ID,
+            "care_event_id": bill["care_event_id"],
+            "event_type": "Entleistung",
+        })
+        if not event:
+            continue
+        created_at = event.get("created_at") or bill.get("created_at")
+        if not isinstance(created_at, datetime):
+            continue
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if created_at > cutoff:
+            continue
+        has_rzh_correction = database.rzh_reconciliation_items.find_one({
+            "org_id": DEFAULT_ORG_ID,
+            "matched_care_event_id": bill["care_event_id"],
+            "section_type": {"$ne": "gutschrift"},
+            "amount_cents": {"$lt": 0},
+        })
+        if has_rzh_correction:
+            continue
+        database.billing_details.update_one({"_id": bill["_id"]}, {"$set": {
+            "billing_status": "not_needed",
+            "not_needed_reason": "no_rzh_correction_after_four_months",
+            "not_needed_at": now,
+            "updated_at": now,
+        }})
+        database.care_event_history.insert_one({
+            "org_id": DEFAULT_ORG_ID,
+            "care_event_id": bill["care_event_id"],
+            "action": "entlastung_closed_without_rzh_correction",
+            "created_at": now,
+            "before": {"billing_status": "covered_insurance"},
+            "after": {"billing_status": "not_needed"},
+        })
+        changed += 1
+    return changed
+
+
+@transactional
+def validate_and_fix_sgbxi_amounts(care_event_ids=None) -> Dict[str, Any]:
+    """
+    Report SGBXI events where coverage exceeds the total.
     
     Rule: sum_covered must be <= sum_total (insurance cannot pay more than total)
     
     Returns:
-        Dictionary with corrected_count, total_checked, errors
+        Dictionary with an explicit list of records requiring review.
     """
     try:
         db = get_database()
         
         # Find SGBXI records where sum_covered > sum_total
+        if not care_event_ids:
+            raise ValueError("Explicit unissued care event IDs are required")
         reversed_records = list(db.care_events.find({
+            "care_event_id": {"$in": care_event_ids},
             "org_id": DEFAULT_ORG_ID,
             "event_type": "SGBXI",
             "$expr": {"$gt": ["$sum_covered", "$sum_total"]}
         }))
-        
-        corrected_count = 0
-        
-        for ce in reversed_records:
-            care_event_id = ce.get("care_event_id")
-            sum_covered = ce.get("sum_covered", 0)
-            sum_total = ce.get("sum_total", 0)
-            corrected_sum_covered = sum_total
-            corrected_sum_total = sum_covered
-            
-            # Swap them
-            db.care_events.update_one(
-                {"care_event_id": care_event_id, "org_id": DEFAULT_ORG_ID},
-                {
-                    "$set": {
-                        "sum_covered": corrected_sum_covered,
-                        "sum_total": corrected_sum_total,
-                        "updated_at": datetime.utcnow()
-                    }
-                }
-            )
-
-            # Keep billing_details in sync with the corrected care_event totals.
-            investitionskosten = corrected_sum_total * 0.06
-            amount_owed = corrected_sum_total - corrected_sum_covered + investitionskosten
-            db.billing_details.update_many(
-                {"care_event_id": care_event_id, "org_id": DEFAULT_ORG_ID},
-                {
-                    "$set": {
-                        "sum_covered": corrected_sum_covered,
-                        "sum_total": corrected_sum_total,
-                        "investitionskosten": investitionskosten,
-                        "amount_owed": amount_owed,
-                        "updated_at": datetime.utcnow()
-                    }
-                }
-            )
-            
-            logger.warning(f"✓ AUTO-CORRECTED SGBXI {care_event_id}: "
-                          f"swapped sum_covered={sum_covered:.2f} <-> sum_total={sum_total:.2f}")
-            corrected_count += 1
         
         # Get total SGBXI count
         total_sgbxi = db.care_events.count_documents({
@@ -1125,15 +874,11 @@ def validate_and_fix_sgbxi_amounts() -> Dict[str, Any]:
         })
         
         return {
-            'corrected_count': corrected_count,
+            'corrected_count': 0,
             'total_checked': total_sgbxi,
-            'errors': []
+            'errors': [ce.get("care_event_id") for ce in reversed_records]
         }
         
     except Exception as e:
-        logger.error(f"Error validating SGBXI amounts: {e}")
-        return {
-            'corrected_count': 0,
-            'total_checked': 0,
-            'errors': [str(e)]
-        }
+        logger.error("Operation failed (%s)", type(e).__name__)
+        raise

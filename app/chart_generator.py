@@ -4,6 +4,7 @@ Generates data for dashboards and visualizations.
 """
 from typing import Dict, Any, List
 from datetime import datetime
+from app.utils.validation import parse_service_date
 from app.core.logging import get_logger
 from app.db import CareEventRepository, PatientRepository
 
@@ -59,7 +60,7 @@ def generate_patient_histogram(patient_id: str) -> Dict[str, Any]:
                 try:
                     # Parse date from DD.MM.YY format
                     date_str = date_str.strip()
-                    dt = datetime.strptime(date_str, "%d.%m.%y")
+                    dt = parse_service_date(date_str)
                     month_key = dt.strftime("%m%Y")
                     month_display = dt.strftime("%m/%Y")
                     year = dt.strftime("%Y")
@@ -93,7 +94,7 @@ def generate_patient_histogram(patient_id: str) -> Dict[str, Any]:
         
         # Convert to sorted array format for charting
         chart_data = []
-        for month_key in sorted(month_data.keys()):
+        for month_key in sorted(month_data.keys(), key=lambda month: (month[2:], month[:2])):
             entry = {
                 "month": month_data[month_key]["display"],
                 "SGBXI": round(month_data[month_key]["SGBXI"], 2),

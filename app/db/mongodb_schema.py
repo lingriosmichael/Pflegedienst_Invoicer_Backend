@@ -63,7 +63,41 @@ def create_collections_and_indexes():
 
         # Collection 8: entlastung_year_balance
         _create_entlastung_year_balance_collection(db)
-        
+
+        # Collection 9: pdf_audit_documents
+        _create_pdf_audit_documents_collection(db)
+
+        # Collection 10: pdf_audit_lines
+        _create_pdf_audit_lines_collection(db)
+        db.care_events.create_index(
+            [("org_id", 1), ("invoicing_month", 1), ("origin_chunk_id", 1)],
+            unique=True, partialFilterExpression={"origin_chunk_id": {"$type": "string"}},
+            name="idx_import_record_unique")
+        db.import_jobs.create_index([("org_id", 1), ("import_id", 1)], unique=True)
+        db.service_packet_charges.create_index(
+            [("org_id", 1), ("patient_id", 1), ("invoicing_month", 1)], unique=True)
+        db.rzh_reconciliation_batches.create_index(
+            [("org_id", 1), ("source_pdf_hash", 1)], unique=True,
+            name="idx_rzh_batch_source_unique")
+        db.rzh_reconciliation_items.create_index(
+            [("org_id", 1), ("item_fingerprint", 1)], unique=True,
+            name="idx_rzh_item_fingerprint_unique")
+        db.rzh_reconciliation_items.create_index(
+            [("org_id", 1), ("match_status", 1), ("apply_status", 1)],
+            name="idx_rzh_item_review")
+        db.entlastung_opening_snapshots.create_index(
+            [("org_id", 1), ("patient_id", 1), ("entitlement_year", 1)], unique=True,
+            name="idx_entlastung_opening_snapshot_unique")
+        db.entlastung_balance_adjustments.create_index(
+            [("org_id", 1), ("patient_id", 1), ("entitlement_year", 1)],
+            name="idx_entlastung_balance_adjustments_patient")
+        db.entlastung_balance_adjustments.create_index(
+            [("org_id", 1), ("reconciliation_item_id", 1)], unique=True,
+            name="idx_entlastung_balance_adjustments_item_unique")
+        db.entlastung_replay_runs.create_index(
+            [("org_id", 1), ("patient_id", 1), ("entitlement_year", 1)],
+            name="idx_entlastung_replay_runs_patient")
+
         logger.info("✓ All MongoDB collections and indexes initialized successfully")
         
         # Log summary
@@ -185,15 +219,15 @@ def _create_billing_details_collection(db):
     
     db[coll_name].create_index(
         [("org_id", 1), ("care_event_id", 1)],
-        name="idx_org_care_event_id"
+        name="idx_org_care_event_id", unique=True
     )
     logger.debug(f"  ✓ Index: org_id + care_event_id")
     
     db[coll_name].create_index(
-        [("org_id", 1), ("invoicing_month", 1), ("invoice_number", 1)],
+        [("org_id", 1), ("invoice_number", 1)],
         unique=True,
-        partialFilterExpression={"invoice_number": {"$type": "string"}},
-        name="idx_org_month_invoice_number_unique"
+        partialFilterExpression={"invoice_number": {"$type": "number"}},
+        name="idx_org_invoice_number_unique"
     )
     logger.debug(f"  ✓ Index: org_id + month + invoice_number (unique, partial, compound)")
 
@@ -306,6 +340,41 @@ def _create_invoice_sequences_collection(db):
         logger.warning(f"  ⚠ Could not initialize sequence: {e}")
 
 
+def _create_pdf_audit_documents_collection(db):
+    """Create pdf_audit_documents collection (per-PDF audit metadata, independent of care_events)."""
+    coll_name = "pdf_audit_documents"
+
+    if coll_name not in db.list_collection_names():
+        logger.debug(f"Creating collection: {coll_name}")
+        db.create_collection(coll_name)
+
+    db[coll_name].create_index(
+        [("org_id", 1), ("year", 1), ("source_file", 1)],
+        unique=True,
+        name="idx_org_year_source_file_unique"
+    )
+    logger.debug(f"  ✓ Index: org_id + year + source_file (unique, compound)")
+
+
+def _create_pdf_audit_lines_collection(db):
+    """Create pdf_audit_lines collection (per-service-line audit rows extracted directly from PDFs)."""
+    coll_name = "pdf_audit_lines"
+
+    if coll_name not in db.list_collection_names():
+        logger.debug(f"Creating collection: {coll_name}")
+        db.create_collection(coll_name)
+
+    db[coll_name].create_index(
+        [("org_id", 1), ("document_id", 1)],
+        name="idx_org_document"
+    )
+    db[coll_name].create_index(
+        [("org_id", 1), ("year", 1), ("billing_month", 1), ("service_code", 1)],
+        name="idx_org_year_month_code"
+    )
+    logger.debug(f"  ✓ Index: org_id + document_id, and org_id + year + billing_month + service_code")
+
+
 def verify_schema():
     """
     Verify that all required collections exist and have proper indexes.
@@ -322,7 +391,12 @@ def verify_schema():
         "billing_summary",
         "care_event_history",
         "entlastungsleistung_tracking",
-        "invoice_sequences"
+        "invoice_sequences",
+        "rzh_reconciliation_batches",
+        "rzh_reconciliation_items",
+        "entlastung_opening_snapshots",
+        "pdf_audit_documents",
+        "pdf_audit_lines",
     ]
     
     existing_collections = db.list_collection_names()

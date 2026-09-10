@@ -1,238 +1,213 @@
-import os
-import shutil
+import hashlib
+import re
 import uuid
-import traceback
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 
-import app.database as database
-import app.pdf_parser as pdf_parser
-from app.core.logging import get_logger
+from app import pdf_parser
+from app import database as accounting_database
+from app.db import DEFAULT_ORG_ID
+from app.db.mongodb_config import get_database
+from app.db.transactions import transactional
+from app.utils.validation import BillingMonth, validate_month
 
-logger = get_logger(__name__)
 
 router = APIRouter()
+UPLOAD_DIR = Path("data/abrechnung")
+ImportMode = Literal["sgbxi", "sgbv", "verhinderungspflege", "entleistung"]
+ImportEngine = Literal["llm", "deterministic"]
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
-UPLOAD_DIR = "data/abrechnung"
-def _prepare_chunks_for_file(file_name: str, abrechnungsmonat: str):
-    """Extract and cache PDF chunks for processing."""
-    path = os.path.join(UPLOAD_DIR, file_name)
-    text = pdf_parser.extract_text_from_pdf(path)
 
-    # Extract billing summary from first page
-    first_page_text = pdf_parser.extract_first_page_text(path)
-    billing_summary = pdf_parser.extract_billing_summary(first_page_text)
-    if billing_summary:
-        database.insert_billing_summary(billing_summary, abrechnungsmonat)
-
-    raw_chunks = pdf_parser.split_into_chunks(text)
-    now_ts = datetime.now().isoformat()
-
-    chunk_entries = []
-    for chunk_text in raw_chunks:
-        cid = str(uuid.uuid4())
-        chunk_entry = {
-            "chunk_id": cid,
-            "text": chunk_text,
-            "source_pdf": file_name,
-            "patient_name": None,
-            "created_at": now_ts,
-        }
-        chunk_entries.append(chunk_entry)
-
-    pdf_parser.store_chunks_temp(abrechnungsmonat, chunk_entries)
-    return chunk_entries
 class ProcessRequest(BaseModel):
     file_name: str
-    abrechnungsmonat: str
-    mode: str   # "sgbxi", "sgbv", "verhinderungspflege", or "entleistung"
-def _safe_upload_filename(original_filename: str) -> str:
-    """Build a filesystem-safe filename that cannot escape UPLOAD_DIR."""
-    base_name = os.path.basename(original_filename or "")
-    if not base_name.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only .pdf files are accepted")
-    safe_stem = "".join(c for c in os.path.splitext(base_name)[0] if c.isalnum() or c in ("-", "_")) or "upload"
-    return f"{safe_stem}_{uuid.uuid4().hex[:8]}.pdf"
+    abrechnungsmonat: BillingMonth
+    mode: ImportMode = "sgbxi"
+    import_id: str | None = None
+    engine: ImportEngine = "llm"
+
+
+class RetryRequest(BaseModel):
+    import_id: str
+    mode: ImportMode
+    engine: ImportEngine = "llm"
+
+
+def resolve_pdf(filename):
+    root = Path(UPLOAD_DIR).resolve()
+    candidate = root / filename
+    if candidate.is_symlink():
+        raise HTTPException(status_code=404, detail="Uploaded PDF not found")
+    path = candidate.resolve()
+    if path.parent != root or path.suffix.lower() != ".pdf" or not path.is_file():
+        raise HTTPException(status_code=404, detail="Uploaded PDF not found")
+    return path
+
+
+def file_hash(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _safe_upload_filename(original_filename):
+    name = Path(original_filename or "").name
+    if Path(name).suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+    stem = re.sub(r"[^a-zA-Z0-9_-]", "", Path(name).stem)[:100] or "upload"
+    return f"{stem}_{uuid.uuid4().hex}.pdf"
 
 
 @router.post("/upload_pdf")
-def upload_pdf(file: UploadFile = File(...), abrechnungsmonat: str = Form(...)):
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    safe_filename = _safe_upload_filename(file.filename)
-    file_path = os.path.join(UPLOAD_DIR, safe_filename)
+def upload_pdf(file: UploadFile = File(...), abrechnungsmonat: str | None = Form(None)):
+    if abrechnungsmonat:
+        validate_month(abrechnungsmonat)
+    root = Path(UPLOAD_DIR)
+    root.mkdir(parents=True, exist_ok=True)
+    filename = _safe_upload_filename(file.filename)
+    path = root / filename
+    size = 0
+    try:
+        with path.open("xb") as stream:
+            path.chmod(0o600)
+            while block := file.file.read(1024 * 1024):
+                size += len(block)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="PDF exceeds 50 MB")
+                stream.write(block)
+        with path.open("rb") as stream:
+            if b"%PDF-" not in stream.read(1024):
+                raise HTTPException(status_code=400, detail="Invalid PDF")
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return {"status": "stored", "filename": filename}
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
 
-    return {"status": "stored", "filename": safe_filename}
 @router.get("/previous_imports")
 def get_previous_imports():
-    """Get list of previously imported PDF files from data/abrechnung/"""
-    import hashlib
-    from pathlib import Path
-
-    abrechnung_dir = Path("data/abrechnung")
-    if not abrechnung_dir.exists():
-        return {"files": []}
-
     files = []
-    for pdf_file in sorted(abrechnung_dir.glob("*.pdf"), reverse=True):
-        try:
-            # Calculate file hash for tracking
-            with open(pdf_file, "rb") as f:
-                file_hash = hashlib.md5(f.read()).hexdigest()
-
-            files.append({
-                "filename": pdf_file.name,
-                "filepath": str(pdf_file),
-                "file_hash": file_hash,
-                "size": pdf_file.stat().st_size,
-                "modified": pdf_file.stat().st_mtime
-            })
-        except Exception as e:
-            logger.warning(f"Could not read file {pdf_file}: {e}")
-
+    for path in sorted(Path(UPLOAD_DIR).glob("*.pdf"), reverse=True):
+        safe_path = resolve_pdf(path.name)
+        stat = safe_path.stat()
+        files.append({"filename": path.name, "file_hash": file_hash(safe_path),
+                      "size": stat.st_size, "modified": stat.st_mtime})
     return {"files": files}
 
-@router.post("/reimport_pdf")
-def reimport_pdf(filename: str = Form(...), abrechnungsmonat: str = Form(...), import_mode: str = Form("sgbxi")):
-    """Re-import a previously imported PDF file"""
-    import hashlib
-    from pathlib import Path
 
-    abrechnung_dir = Path("data/abrechnung").resolve()
-    pdf_path = (abrechnung_dir / os.path.basename(filename)).resolve()
+@transactional
+def register_import(document, summary):
+    database = get_database()
+    identity = {"org_id": DEFAULT_ORG_ID, "import_id": document["import_id"]}
+    if database.import_jobs.find_one(identity):
+        return
+    database.import_jobs.insert_one(document)
+    if summary:
+        database.billing_summary.update_one(
+            {"org_id": DEFAULT_ORG_ID, "abrechnungsmonat": document["invoicing_month"]},
+            {"$inc": summary, "$set": {"updated_at": datetime.now(timezone.utc)}}, upsert=True)
 
-    if abrechnung_dir not in pdf_path.parents or not pdf_path.exists():
-        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
 
-    try:
-        # Calculate file hash
-        with open(pdf_path, "rb") as f:
-            file_hash = hashlib.md5(f.read()).hexdigest()
+def prepare_import(filename, month):
+    validate_month(month)
+    if get_database().care_events.find_one({"org_id": DEFAULT_ORG_ID, "invoicing_month": month,
+            "event_type": {"$ne": "ServicePacket"}, "import_identity_version": {"$ne": 1}}):
+        raise HTTPException(409, "This month contains legacy imports; reconcile source identities before importing again")
+    path = resolve_pdf(filename)
+    digest = file_hash(path)
+    import_id = hashlib.sha256(f"{DEFAULT_ORG_ID}:{month}:{digest}".encode()).hexdigest()
+    chunks = pdf_parser.split_into_chunks(pdf_parser.extract_text_from_pdf(str(path)))
+    summary = pdf_parser.extract_billing_summary(pdf_parser.extract_first_page_text(str(path)))
+    document = {"org_id": DEFAULT_ORG_ID, "import_id": import_id, "invoicing_month": month,
+                "file_name": path.name, "file_hash": digest, "prepared_chunks": len(chunks),
+                "summary_available": bool(summary), "created_at": datetime.now(timezone.utc)}
+    register_import(document, summary)
+    return get_database().import_jobs.find_one({"org_id": DEFAULT_ORG_ID, "import_id": import_id})
 
-        # Process the PDF using the standard flow
-        logger.info(f"Starting re-import of {filename} (mode: {import_mode}, month: {abrechnungsmonat})")
 
-        # Step 1: Prepare chunks (extract, split, cache)
-        text = pdf_parser.extract_text_from_pdf(str(pdf_path))
+def load_chunks(job):
+    path = resolve_pdf(job["file_name"])
+    if file_hash(path) != job["file_hash"]:
+        raise HTTPException(status_code=409, detail="Uploaded PDF changed; prepare a new import")
+    texts = pdf_parser.split_into_chunks(pdf_parser.extract_text_from_pdf(str(path)))
+    return [{"text": text, "source_pdf": job["file_name"],
+             "chunk_id": hashlib.sha256(f'{job["file_hash"]}:{index}:{text}'.encode()).hexdigest()}
+            for index, text in enumerate(texts)]
 
-        # Extract billing summary from first page
-        first_page_text = pdf_parser.extract_first_page_text(str(pdf_path))
-        billing_summary = pdf_parser.extract_billing_summary(first_page_text)
-        if not billing_summary:
-            # If extraction fails, generate random summary data
-            billing_summary = pdf_parser.generate_random_billing_summary()
-            logger.info(f"Generated random billing summary: {billing_summary}")
-        if billing_summary:
-            database.insert_billing_summary(billing_summary, abrechnungsmonat)
 
-        raw_chunks = pdf_parser.split_into_chunks(text)
-        now_ts = datetime.now().isoformat()
-
-        chunk_entries = []
-        for chunk_text in raw_chunks:
-            cid = str(uuid.uuid4())
-            chunk_entry = {
-                "chunk_id": cid,
-                "text": chunk_text,
-                "source_pdf": filename,
-                "patient_name": None,
-                "created_at": now_ts,
-            }
-            chunk_entries.append(chunk_entry)
-
-        pdf_parser.store_chunks_temp(abrechnungsmonat, chunk_entries)
-        logger.info(f"Prepared PDF: {len(chunk_entries)} chunks")
-
-        # Step 2: Filter and process by mode
-        filtered = pdf_parser.filter_chunks_by_mode(chunk_entries, import_mode)
-        logger.info(f"Filtered chunks: {len(filtered)} chunks for mode '{import_mode}'")
-
-        # Route to appropriate processing function based on mode
-        inserted = 0
-        if import_mode == "sgbxi":
-            inserted = pdf_parser.process_import_sgbxi(filtered, abrechnungsmonat)
-        elif import_mode == "sgbv":
-            inserted = pdf_parser.process_import_sgbv(filtered, abrechnungsmonat)
-        elif import_mode == "verhinderungspflege":
-            inserted = pdf_parser.process_import_verhinderungspflege(filtered, abrechnungsmonat)
-        elif import_mode == "entleistung":
-            # Entleistung also uses process_import_sgbxi (special handling in filter_chunks_by_mode)
-            inserted = pdf_parser.process_import_sgbxi(filtered, abrechnungsmonat)
-        else:
-            raise ValueError(f"Unknown processing mode: {import_mode}")
-
-        # Record the import
-        database.record_file_import(
-            filename=filename,
-            abrechnungsmonat=abrechnungsmonat,
-            import_mode=import_mode,
-            file_hash=file_hash,
-            invoice_count=inserted
-        )
-
-        logger.info(f"✓ Re-import complete: {inserted} invoices processed from {filename}")
-
-        return {
-            "status": "success",
-            "filename": filename,
-            "inserted": inserted,
-            "mode": import_mode,
-            "abrechnungsmonat": abrechnungsmonat
-        }
-
-    except Exception as e:
-        logger.error(f"Error re-importing {filename}: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
 @router.post("/prepare_pdf")
 def prepare_pdf(req: ProcessRequest):
-    """
-    Step 1: User clicks 'Weiter' after upload.
-    Extract text → split into chunks → cache for later mode selection.
-    """
-    chunk_entries = _prepare_chunks_for_file(req.file_name, req.abrechnungsmonat)
-    return {
-        "status": "prepared",
-        "file_name": req.file_name,
-        "imported_chunks": len(chunk_entries),
-    }
+    job = prepare_import(req.file_name, req.abrechnungsmonat)
+    return {"status": "prepared", "import_id": job["import_id"], "file_name": job["file_name"],
+            "prepared_chunks": job["prepared_chunks"], "imported_chunks": job["prepared_chunks"],
+            "summary_available": job["summary_available"]}
+
+
+def process_job(job, mode, failed_only=False, engine="llm"):
+    chunks = pdf_parser.filter_chunks_by_mode(load_chunks(job), mode)
+    if failed_only:
+        failed_ids = job.get("results", {}).get(mode, {}).get("failed_ids", [])
+        chunks = [chunk for chunk in chunks if chunk["chunk_id"] in failed_ids]
+    helper = {"sgbxi": pdf_parser.process_import_sgbxi, "entleistung": pdf_parser.process_import_sgbxi,
+              "sgbv": pdf_parser.process_import_sgbv,
+              "verhinderungspflege": pdf_parser.process_import_verhinderungspflege}[mode]
+    result = helper(chunks, job["invoicing_month"], engine=engine)
+    rematch = None
+    if mode in {"sgbv", "verhinderungspflege"} and result["committed"]:
+        accounting_database.mark_month_ready_for_generation(
+            job["invoicing_month"],
+            event_types=["SGBV" if mode == "sgbv" else "Verhinderungspflege"],
+        )
+    if mode == "entleistung" and result["committed"]:
+        # Entlastungsleistung is assumed fully covered on import. This creates
+        # its durable audit marker now; only a later confirmed RZH correction
+        # may turn that individual row into invoice_needed.
+        accounting_database.mark_month_ready_for_generation(
+            job["invoicing_month"],
+            event_types=["Entleistung"],
+        )
+        accounting_database.expire_stale_entlastung_coverage()
+        try:
+            from app.rzh_reconciliation import retry_unresolved_matches
+            rematch = retry_unresolved_matches()
+        except Exception as error:
+            logger.warning("Post-import RZH rematch failed (%s)", type(error).__name__)
+            rematch = {"status": "failed", "financial_effects_applied": False}
+    get_database().import_jobs.update_one(
+        {"org_id": DEFAULT_ORG_ID, "import_id": job["import_id"]},
+        {"$set": {f"results.{mode}": result, "updated_at": datetime.now(timezone.utc)}})
+    return {**result, "status": "partial" if result["failed"] else "processed",
+            "mode": mode, "import_id": job["import_id"], "imported_chunks": result["committed"],
+            "inserted": result["committed"], "reconciliation_rematch": rematch}
+
+
 @router.post("/process_pdf")
 def process_pdf(req: ProcessRequest):
-    """
-    Step 2: User selects a mode (sgbxi, sgbv, verhinderungspflege, or entleistung).
-    Reuses cached chunks → filters by Pflegekonto → imports to appropriate table.
-    """
-    chunks = pdf_parser.get_chunks_temp(req.abrechnungsmonat)
-    if not chunks:
-        # fallback only if cache was lost (e.g. app restarted)
-        chunks = _prepare_chunks_for_file(req.file_name, req.abrechnungsmonat)
-
-    filtered = pdf_parser.filter_chunks_by_mode(chunks, req.mode)
-
-    # Route to appropriate processing function based on mode
-    if req.mode == "sgbxi":
-        pdf_parser.process_import_sgbxi(filtered, req.abrechnungsmonat)
-    elif req.mode == "sgbv":
-        pdf_parser.process_import_sgbv(filtered, req.abrechnungsmonat)
-    elif req.mode == "verhinderungspflege":
-        pdf_parser.process_import_verhinderungspflege(filtered, req.abrechnungsmonat)
-    elif req.mode == "entleistung":
-        pdf_parser.process_import_sgbxi(filtered, req.abrechnungsmonat)  # Special 4064 handling in process_import_sgbxi
+    if req.import_id:
+        job = get_database().import_jobs.find_one({"org_id": DEFAULT_ORG_ID, "import_id": req.import_id})
+        if not job or job["invoicing_month"] != req.abrechnungsmonat or job["file_hash"] != file_hash(resolve_pdf(req.file_name)):
+            raise HTTPException(status_code=409, detail="Import identity does not match the file and month")
     else:
-        raise ValueError(f"Unknown processing mode: {req.mode}")
+        job = prepare_import(req.file_name, req.abrechnungsmonat)
+    return process_job(job, req.mode, engine=req.engine)
 
-    # Auto-validate and fix any reversed sum_covered/sum_total in SGBXI records
-    if req.mode in ["sgbxi", "entleistung"]:
-        validation_result = database.validate_and_fix_sgbxi_amounts()
-        if validation_result['corrected_count'] > 0:
-            logger.info(f"Auto-corrected {validation_result['corrected_count']} SGBXI records with reversed amounts")
 
-    return {
-        "status": "processed",
-        "mode": req.mode,
-        "imported_chunks": len(filtered),
-    }
+@router.post("/reimport_pdf")
+def reimport_pdf(filename: str = Form(...), abrechnungsmonat: BillingMonth = Form(...),
+                 import_mode: ImportMode = Form("sgbxi"), engine: ImportEngine = Form("llm")):
+    job = prepare_import(filename, abrechnungsmonat)
+    return process_job(job, import_mode, engine=engine)
+
+
+@router.post("/retry_failed")
+def retry_failed(req: RetryRequest):
+    job = get_database().import_jobs.find_one({"org_id": DEFAULT_ORG_ID, "import_id": req.import_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="Import not found")
+    return process_job(job, req.mode, failed_only=True, engine=req.engine)

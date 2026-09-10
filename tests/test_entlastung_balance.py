@@ -52,7 +52,7 @@ def _seed_row(db, patient_id, year, credited_through_month, accrued, used):
 
 @pytest.mark.parametrize("month,expected", [
     ("062026", False),
-    ("072026", False),
+    ("072026", True),
     ("082026", True),
     ("092026", True),
     ("072025", False),
@@ -154,10 +154,10 @@ def test_seed_patient_with_no_usage(db):
     summary = eb.seed_entlastung_2026_balances()
     assert summary == {"seeded": 1, "skipped_existing": 0, "total_patients": 1}
     row = eb.get_balance("pat_1", 2026)
-    assert row["accrued_amount"] == pytest.approx(131.0 * 7)
+    assert row["accrued_amount"] == pytest.approx(131.0 * 6)
     assert row["used_amount"] == 0
-    assert row["remaining_amount"] == pytest.approx(131.0 * 7)
-    assert row["credited_through_month"] == "072026"
+    assert row["remaining_amount"] == pytest.approx(131.0 * 6)
+    assert row["credited_through_month"] == "062026"
 
 
 def test_seed_patient_with_partial_usage(db):
@@ -168,7 +168,7 @@ def test_seed_patient_with_partial_usage(db):
     row = eb.get_balance("pat_1", 2026)
     expected_used = 100.0 + 127.35
     assert row["used_amount"] == pytest.approx(expected_used)
-    assert row["remaining_amount"] == pytest.approx(131.0 * 7 - expected_used)
+    assert row["remaining_amount"] == pytest.approx(131.0 * 6 - expected_used)
 
 
 def test_seed_caps_each_historical_event_at_legacy_cap(db):
@@ -182,14 +182,14 @@ def test_seed_caps_each_historical_event_at_legacy_cap(db):
 def test_seed_floors_remaining_at_zero_when_usage_exceeds_accrual(db):
     _make_patient(db, "pat_1")
     # two Entleistung events in the same month push monthly usage above the 131 monthly credit
-    for month in ["012026", "022026", "032026", "042026", "052026", "062026", "072026"]:
+    for month in ["012026", "022026", "032026", "042026", "052026", "062026"]:
         _make_entleistung_event(db, "pat_1", month, 127.35)
-    _make_entleistung_event(db, "pat_1", "072026", 127.35)  # second event in July
+    _make_entleistung_event(db, "pat_1", "062026", 127.35)  # second event in June
     eb.seed_entlastung_2026_balances()
     row = eb.get_balance("pat_1", 2026)
     assert row["remaining_amount"] == 0.0
-    # August should still add exactly one more month's credit on top of the floored balance
-    updated = eb.ensure_entlastung_credit_through("pat_1", "082026")
+    # July should still add exactly one more month's credit on top of the floored balance
+    updated = eb.ensure_entlastung_credit_through("pat_1", "072026")
     assert updated["remaining_amount"] == pytest.approx(131.0)
 
 

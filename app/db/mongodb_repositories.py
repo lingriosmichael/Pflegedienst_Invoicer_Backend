@@ -73,7 +73,7 @@ class InvoiceRepository:
             return next_number
             
         except Exception as e:
-            logger.error(f"Error generating invoice number: {e}")
+            logger.error("Operation failed (%s)", type(e).__name__)
             raise
 
     @staticmethod
@@ -370,7 +370,7 @@ class PatientRepository:
             logger.info(f"Created patient {patient_id}")
             return patient_id
         except DuplicateKeyError as e:
-            logger.error(f"Duplicate patient error: {e}")
+            logger.error("Operation failed (%s)", type(e).__name__)
             raise
 
     @staticmethod
@@ -506,7 +506,7 @@ class CareEventRepository:
             logger.info(f"Created care event {care_event_id} with {len(care_event_data['services'])} services")
             return care_event_id
         except DuplicateKeyError as e:
-            logger.error(f"Duplicate care event: {e}")
+            logger.error("Operation failed (%s)", type(e).__name__)
             raise
 
     @staticmethod
@@ -690,7 +690,7 @@ class CareEventRepository:
             logger.info(f"get_summary_by_event_type({event_type}): {len(results)} date groups")
             return results
         except Exception as e:
-            logger.error(f"Error in get_summary_by_event_type({event_type}): {e}")
+            logger.error("Operation failed (%s)", type(e).__name__)
             raise
 
     @staticmethod
@@ -760,7 +760,7 @@ class CareEventRepository:
             logger.info(f"get_patient_histogram({patient_id}): {len(results)} type/date groups")
             return results
         except Exception as e:
-            logger.error(f"Error in get_patient_histogram({patient_id}): {e}")
+            logger.error("Operation failed (%s)", type(e).__name__)
             raise
 
     @staticmethod
@@ -803,7 +803,7 @@ class CareEventRepository:
             logger.info(f"aggregate_by_event_type: {len(results)} event types")
             return results
         except Exception as e:
-            logger.error(f"Error in aggregate_by_event_type: {e}")
+            logger.error("Operation failed (%s)", type(e).__name__)
             raise
 
 

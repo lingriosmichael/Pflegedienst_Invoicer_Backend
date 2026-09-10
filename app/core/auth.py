@@ -58,7 +58,9 @@ def create_access_token(username: str) -> str:
 def decode_access_token(token: str) -> str:
     """Return the username ('sub' claim) if the token is valid, else raise InvalidTokenError."""
     try:
-        payload = jwt.decode(token, _get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, _get_jwt_secret(), algorithms=[JWT_ALGORITHM], options={"require": ["sub", "iat", "exp"]})
     except jwt.PyJWTError as e:
         raise InvalidTokenError(str(e))
+    if not isinstance(payload["sub"], str) or not payload["sub"]:
+        raise InvalidTokenError("Invalid token subject")
     return payload["sub"]
